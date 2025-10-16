@@ -19,17 +19,34 @@ class ngrams(Dataset):
     Dataset for the in context markov learning. Each example is a series of outputs from a markov chain
     """
 
-    def __init__(self, split:str, n:int, length = 101, num_symbols = 2, size = 1000, last_token_only = False, device = 'cpu', offline=False):
-        self.length = length
+    def __init__(
+        self, 
+        split:str, # 'train' or 'test'
+        n:int, # order of the markov chain? 
+        length = 101, # length of each sequence
+        num_symbols = 2, # num of tokens # from the paper this is called k, k=2 or 3
+        size = 1000, # number of sequences in dataset
+        last_token_only = False, # ?
+        device = 'cpu', 
+        offline=False
+    ):
+        self.length = length # length of each sequence
         self.num_symbols = num_symbols
         self.split = split
         self.offline = offline
         assert split in ['train', 'test'], f"split must be 'train' or 'test' not {split}"
-        self.size = size
+        self.size = size # number of sequences in dataset
+
         self.last_token_only = last_token_only
         self.device = device
         self.n = n - 1
-        self.transition_matrix_gen = torch.distributions.dirichlet.Dirichlet(torch.ones((num_symbols**(n-1),num_symbols), device = device)).sample
+        # if n = 1, this is a unigram model
+        # if n = 2, this is a bigram model
+
+        # generate random transition probabilities from dirichlet distribution
+        # P: transition matrix, P_{i:} ~ Dirichlet(1,1,...,1) 
+        self.transition_matrix_gen = torch.distributions.dirichlet.Dirichlet(torch.ones((num_symbols**(n-1),num_symbols), device = device)).sample 
+
         
         # Compute powers of num_symbols
         self.powers = self.num_symbols ** torch.arange(self.n - 1, -1, -1, device=device, dtype=torch.long)  # Shape: (n,)
@@ -48,6 +65,9 @@ class ngrams(Dataset):
         return self.length
     
     def stationary_distribution(self, transition_matrices):
+        '''
+        Compute the stationary distribution of the markov chain with transition matrix P
+        '''
         if self.n > 1:
             temp = torch.zeros(transition_matrices[...,0,0].size()+torch.Size((self.num_symbols**(self.n),self.num_symbols**(self.n))), device = self.device)
             for i in range(self.num_symbols ** self.n):
@@ -114,7 +134,7 @@ class ngrams(Dataset):
         # print((l, self.conv))
         # exit()
         # print()
-        return (l * self.conv).sum(axis=1)
+        return (l * self.conv).sum(axis=1).long()
 
     # def single_symbol_convert(self, m):
     #     if self.n == 1:

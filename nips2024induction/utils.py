@@ -4,38 +4,60 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import math
 
-def stationary_distribution(P):
-    if len(P.shape) == 2:
-      pi = torch.ones((1, P.size(1)), device=P.device, dtype=P.dtype) / P.size(0)
-    elif len(P.shape) == 3:
-      pi = torch.ones((P.size(0), 1, P.size(1)), device=P.device, dtype=P.dtype) / P.size(0)
-    else:
-      raise ValueError(f"P has shape {P.size()}, but P must be 2D or 3D tensor")
-    if P.size(-1) < 5:
-      P_next = torch.linalg.matrix_power(P,16)
-      # while not torch.allclose(P, P_next):
-      #   P = P_next
-      #   P_next = torch.linalg.matrix_power(P,2)
-      # print(P_next[0])
-      return P_next.mean(axis=-1)
+def stationary_distribution(P: torch.Tensor):
+    """
+    Returns the stationary distribution(s) for a (batched) Markov chain.
 
+    Supports:
+      - 2D square: (N, N)
+      - 3D batched square: (B, N, N)
+      - Non-square categorical rows (e.g., unigram): (1, K) or (B, 1, K)
+        -> treated as already being the stationary distribution(s).
+    """
+    # --- Non-square guard (e.g., unigram n=1 gives 1 x K) ---
+    if P.size(-2) != P.size(-1):
+        # Normalize along the last dim and squeeze the singleton "state" axis.
+        if P.dim() == 2:         # (1, K) -> (K,)
+            pi = P / P.sum(dim=-1, keepdim=True)
+            return pi.squeeze(0)
+        elif P.dim() == 3:       # (B, 1, K) -> (B, K)
+            pi = P / P.sum(dim=-1, keepdim=True)
+            return pi.squeeze(-2)
+        else:
+            raise ValueError(f"Unsupported non-square P shape: {tuple(P.shape)}")
+
+    # --- Square cases below ---
+    if P.dim() == 2:             # (N, N)
+        N = P.size(0)
+        # uniform init over states
+        pi = torch.full((1, N), 1.0 / N, device=P.device, dtype=P.dtype)
+    elif P.dim() == 3:           # (B, N, N)
+        B, N, _ = P.shape
+        pi = torch.full((B, 1, N), 1.0 / N, device=P.device, dtype=P.dtype)
+    else:
+        raise ValueError(f"P has shape {P.size()}, but P must be 2D or 3D tensor")
+
+    # For very small N, use power method shortcut: P^k rows -> stationary dist.
+    # IMPORTANT: take mean over ROWS (dim=-2), not over columns.
+    if P.size(-1) < 5:
+        P_next = torch.linalg.matrix_power(P, 16)
+        pi_pow = P_next.mean(dim=-2)  # 2D: (N,)->(N,)  | 3D: (B,N,N)->(B,N)
+        # normalize just in case of tiny numerical drift
+        return pi_pow / pi_pow.sum(dim=-1, keepdim=True)
+
+    # Otherwise iterate pi_{t+1} = pi_t P until convergence (batched-friendly)
     pi_next = torch.matmul(pi, P)
     i = 0
-    while not torch.allclose(pi_next, pi, atol = 1e-4, rtol = 1e-4):
+    while not torch.allclose(pi_next, pi, atol=1e-4, rtol=1e-4):
         i += 1
         pi = pi_next
         pi_next = torch.matmul(pi, P)
-        if i >= 100:
-          print("OH NO")
-          for a in range(len(pi_next)):
-            if not torch.allclose(pi_next[a], pi[a], atol = 1e-4, rtol = 1e-4):
-              print(P[a])
-              print(pi[a]-pi_next[a])
-              exit()
-          print("OH NO NO")
-          exit()
+        if i >= 1000:  # safety cap
+            break
+
     pi = torch.matmul(pi_next, P).squeeze()
-    return pi / pi.sum(axis=-1, keepdim=True)
+    return pi / pi.sum(dim=-1, keepdim=True)
+
 
 def mean_alg(inp, num_symbols):
   return (torch.bincount(inp, minlength = num_symbols)+1)/(len(inp)+num_symbols)
