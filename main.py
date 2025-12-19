@@ -1,244 +1,135 @@
+import argparse
 import torch
-from torch.utils.data import DataLoader
-from model import Transformer, TransformerConfig
-from dataset import get_dataset
-from utils import AttentionAnalyzer, compute_theoretical_entropy_rate, compute_oracle_loss
+import os
 import tqdm
 import numpy as np
-import os
 import matplotlib.pyplot as plt
+from dataset import DataFactory
+from model import Transformer, TransformerConfig
+from utils import AttentionAnalyzer, compute_theoretical_entropy_rate, compute_oracle_loss
 
-# --- 1. Configuration ---
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def parse_args():
+    parser = argparse.ArgumentParser()
+    # Data
+    parser.add_argument('--data_type', type=str, default='hmm_lda', 
+                    choices=['iid', 'markov', 'edelman_icl', 'hmm_lda', 'fitted_hmm_lda', 'hmm'], # 加入 hmm
+                    help="Type of generative process")
+    parser.add_argument('--consistency', action='store_true', 
+                    help="If True, use fixed global params (LM). If False, sample params per seq (ICL).")
+    parser.add_argument('--n_func_words', type=int, default=None, 
+                        help="Number of syntax tokens (indices 0 to K-1)")
+    parser.add_argument('--source_file', type=str, default=None, help='Source text for fitted generator')
+    parser.add_argument('--vocab_size', type=int, default=50)
+    parser.add_argument('--block_size', type=int, default=64)
+    parser.add_argument('--n_states', type=int, default=5)
+    parser.add_argument('--n_topics', type=int, default=3)
+    parser.add_argument('--train_samples', type=int, default=50000)
+    parser.add_argument('--val_samples', type=int, default=1000)
+    parser.add_argument('--test_samples', type=int, default=1000)
+    parser.add_argument('--batch_size', type=int, default=64)
+    # Model
+    parser.add_argument('--n_layer', type=int, default=2)
+    parser.add_argument('--n_head', type=int, default=4)
+    parser.add_argument('--n_embd', type=int, default=128)
+    parser.add_argument('--attn_only', action='store_true')
+    parser.add_argument('--use_relative_pos', action='store_true')
+    # Training
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--eval_interval', type=int, default=100)
+    parser.add_argument('--save_dir', type=str, default='results')
+    return parser.parse_args()
 
-# Experiment Settings
-DATA_TYPE = 'markov' # Options: 'markov', 'general_markov', 'hmm', 'hmm_lda'
-VOCAB_SIZE = 50
-BLOCK_SIZE = 32
-
-# HMM/LDA Specifics
-N_STATES = 5
-N_TOPICS = 3
-
-# Model Settings
-IS_CAUSAL = True
-N_LAYER = 2
-N_HEAD = 2
-N_EMBD = 64
-
-# Training Settings
-BATCH_SIZE = 64
-MAX_ITERS = 1000      # 稍微加長一點，比較能看到 Phase Transition
-LEARNING_RATE = 1e-3
-EVAL_INTERVAL = 50    # 每 50 步分析一次 Attention 行為
-SAVE_DIR = "results"  #圖片存檔資料夾
-
-def save_experiment_results(history, save_dir):
-    """
-    將訓練過程的數據畫成圖並存檔
-    """
-    os.makedirs(save_dir, exist_ok=True)
+def save_plots(history, args):
+    os.makedirs(args.save_dir, exist_ok=True)
     
-    # 1. Loss & Regret Curve
+    # Loss
     plt.figure(figsize=(10, 5))
-    plt.plot(history['iter'], history['loss'], label='Train Loss', alpha=0.7)
-    if 'oracle_loss' in history and history['oracle_loss']:
-        # 畫一條水平線代表理論極限
-        oracle = history['oracle_loss'][0] # 假設 oracle 是常數
-        plt.axhline(y=oracle, color='r', linestyle='--', label=f'Theoretical Bound ({oracle:.3f})')
-    
-    plt.title(f"Training Loss Curve ({DATA_TYPE})")
-    plt.xlabel("Iteration")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
-    plt.close()
+    plt.plot(history['iter'], history['loss'], label='Train')
+    plt.plot(history['iter'], history['val_loss'], label='Val')
+    if history['oracle']: plt.axhline(history['oracle'][0], color='r', linestyle='--', label='Oracle')
+    plt.title(f"Loss ({args.data_type})")
+    plt.legend(); plt.savefig(os.path.join(args.save_dir, "loss.png")); plt.close()
 
-    # 2. Attention Entropy Evolution (Layer-wise)
-    # 我們想看每一層的 Entropy 隨時間怎麼變化
-    # history['layer_entropies'] 結構: [step_idx][layer_idx] -> scalar (avg over heads)
-    
-    if len(history['layer_entropies']) > 0:
-        n_layers = len(history['layer_entropies'][0])
-        steps = history['eval_steps']
-        
-        plt.figure(figsize=(10, 5))
-        for l in range(n_layers):
-            # 取出這一層在所有時間點的數值
-            vals = [snapshot[l] for snapshot in history['layer_entropies']]
-            plt.plot(steps, vals, marker='.', label=f'Layer {l}')
-            
-        plt.title("Shannon Entropy Evolution (Sparsity)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Entropy (Lower=Sharper)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(save_dir, "entropy_evolution.png"))
-        plt.close()
-
-    # 3. Markov Score Evolution (Alignment to t-1)
-    if len(history['layer_markov_scores']) > 0:
-        n_layers = len(history['layer_markov_scores'][0])
-        steps = history['eval_steps']
-        
-        plt.figure(figsize=(10, 5))
-        for l in range(n_layers):
-            vals = [snapshot[l] for snapshot in history['layer_markov_scores']]
-            plt.plot(steps, vals, marker='.', label=f'Layer {l}')
-            
-        plt.title("Markov Score Evolution (Prob on t-1)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Score (Higher=Local Copy)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(save_dir, "markov_score_evolution.png"))
-        plt.close()
-
-    # 4. Syntax/Topic Entropy Evolution (如果有 HMM/LDA)
-    # 這裡示範 Syntax Entropy
-    if len(history['layer_syntax_entropies']) > 0:
-        n_layers = len(history['layer_syntax_entropies'][0])
-        steps = history['eval_steps']
-        
-        plt.figure(figsize=(10, 5))
-        for l in range(n_layers):
-            vals = [snapshot[l] for snapshot in history['layer_syntax_entropies']]
-            plt.plot(steps, vals, marker='.', label=f'Layer {l}')
-            
-        plt.title("Syntax Entropy Evolution (HMM State Awareness)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Entropy")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(save_dir, "syntax_entropy_evolution.png"))
-        plt.close()
-
-    print(f"Figures saved to {save_dir}/")
+    # Metrics
+    metrics = ['entropies', 'markov', 'syntax', 'topic']
+    for m in metrics:
+        key = f'layer_{m}'
+        if history[key]:
+            plt.figure(figsize=(10, 5))
+            for l in range(len(history[key][0])):
+                vals = [snap[l] for snap in history[key]]
+                plt.plot(history['eval_steps'], vals, marker='.', label=f'L{l}')
+            plt.title(m.capitalize()); plt.legend(); plt.savefig(os.path.join(args.save_dir, f"{m}.png")); plt.close()
 
 def main():
-    print(f"Running Experiment: {DATA_TYPE} on {device}")
-    
-    # --- Data Setup ---
-    dataset_kwargs = {}
-    if DATA_TYPE == 'general_markov':
-        dataset_kwargs['alpha'] = 0.1
-    elif DATA_TYPE == 'hmm':
-        dataset_kwargs['n_states'] = N_STATES
-    elif DATA_TYPE == 'hmm_lda':
-        dataset_kwargs['n_states'] = N_STATES
-        dataset_kwargs['n_topics'] = N_TOPICS
-        
-    train_dataset = get_dataset(DATA_TYPE, VOCAB_SIZE, BLOCK_SIZE, **dataset_kwargs)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+    args = parse_args()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Config: {vars(args)}")
 
-    # --- Theoretical Baseline ---
-    generator = train_dataset.generator
-    theoretical_loss = compute_theoretical_entropy_rate(generator)
+    train_dl, val_dl, test_dl = DataFactory.get_loaders(args)
     
-    # --- Model Setup ---
     config = TransformerConfig(
-        vocab_size=VOCAB_SIZE,
-        block_size=BLOCK_SIZE,
-        n_layer=N_LAYER,
-        n_head=N_HEAD,
-        n_embd=N_EMBD,
-        is_causal=IS_CAUSAL
+        vocab_size=args.vocab_size, block_size=args.block_size,
+        n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
+        attn_only=args.attn_only, use_relative_pos=args.use_relative_pos
     )
-    # Bind extra config for analysis
-    config.n_states = N_STATES
-    config.n_topics = N_TOPICS
+    # Bind extra info for utils
+    config.n_states = args.n_states; config.n_topics = args.n_topics
     
     model = Transformer(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-    # --- Logging Structure ---
-    history = {
-        'iter': [],
-        'loss': [],
-        'oracle_loss': [], # Store theoretical bound for plotting
-        'eval_steps': [],
-        'layer_entropies': [],       # List of [L0_val, L1_val...]
-        'layer_markov_scores': [],
-        'layer_syntax_entropies': []
-    }
-
-    # --- Training Loop ---
-    model.train()
-    iter_loader = iter(train_loader)
-    
-    # 用來計算 Oracle Loss 的 transition matrix (如果有的話)
-    trans_mat = getattr(generator, 'trans_mat', None)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
     analyzer = AttentionAnalyzer()
+    generator = train_dl.dataset.generator
+    oracle_loss = compute_theoretical_entropy_rate(generator)
+    trans_mat = getattr(generator, 'trans_mat', None)
 
-    pbar = tqdm.tqdm(range(MAX_ITERS))
-    for i in pbar:
-        try:
-            x, y, extra = next(iter_loader)
-        except StopIteration:
-            iter_loader = iter(train_loader)
-            x, y, extra = next(iter_loader)
+    history = {'iter': [], 'loss': [], 'val_loss': [], 'oracle': [], 'eval_steps': [], 
+               'layer_entropies': [], 'layer_markov': [], 'layer_syntax': [], 'layer_topic': []}
 
+    model.train()
+    step = 0
+    pbar = tqdm.tqdm(train_dl)
+    
+    for x, y, extra in pbar:
         x, y = x.to(device), y.to(device)
-
-        # 1. Forward & Backward
-        logits, loss, _ = model(x, targets=y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # 2. Basic Logging
-        history['iter'].append(i)
-        history['loss'].append(loss.item())
-        if theoretical_loss:
-            history['oracle_loss'].append(theoretical_loss)
+        _, loss, _ = model(x, targets=y)
         
-        regret_msg = ""
-        # 簡單計算 Regret (Optional, 僅顯示用)
-        if trans_mat is not None and DATA_TYPE in ['markov', 'general_markov']:
-            with torch.no_grad():
-                oracle = compute_oracle_loss(x, y, trans_mat)
-                regret = loss.item() - oracle.item()
-                regret_msg = f" | Regret: {regret:.4f}"
-
-        pbar.set_description(f"Loss: {loss.item():.4f}{regret_msg}")
-
-        # 3. Periodic Evaluation (Analysis)
-        if i % EVAL_INTERVAL == 0:
+        optim.zero_grad(); loss.backward(); optim.step()
+        
+        step += 1
+        if step % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
-                # 重新 forward 一次拿 attention (或者利用當前的 batch，但記得要 eval mode)
-                # 這裡為了方便，直接用當前 batch
+                # Val Loss
+                vlosses = []
+                for vx, vy, _ in val_dl:
+                    _, vl, _ = model(vx.to(device), targets=vy.to(device))
+                    vlosses.append(vl.item())
+                    if len(vlosses) > 10: break
+                avg_vl = np.mean(vlosses)
                 
-                # 需要 extra info 裡的 tensor 也在 device 上
-                extra_gpu = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                             for k, v in extra.items()}
+                # Attention Analysis
+                ex_gpu = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in extra.items()}
+                _, _, atts = model(x, return_att_weights=True)
+                rpt = analyzer.analyze(atts, ex_gpu, config)
                 
-                _, _, att_layers = model(x, return_att_weights=True)
+                history['iter'].append(step)
+                history['loss'].append(loss.item())
+                history['val_loss'].append(avg_vl)
+                if oracle_loss: history['oracle'].append(oracle_loss)
+                history['eval_steps'].append(step)
                 
-                # 執行分析
-                report = analyzer.analyze(att_layers, extra_info=extra_gpu, config=config)
+                mean_h = lambda d: [np.mean(l) for l in d]
+                history['layer_entropies'].append(mean_h(rpt['shannon']))
+                history['layer_markov'].append(mean_h(rpt['markov']))
+                if rpt['syntax']: history['layer_syntax'].append(mean_h(rpt['syntax']))
+                if rpt['topic']: history['layer_topic'].append(mean_h(rpt['topic']))
                 
-                # 儲存 Snapshot (取各個 Head 的平均值，方便畫成一條線)
-                # report['shannon_entropy'] 是一個 list of arrays, len=n_layers, array shape=(n_heads,)
-                
-                # Helper to mean over heads
-                def mean_heads(layer_data):
-                    return [np.mean(layer_val) for layer_val in layer_data]
+            model.train()
+            pbar.set_description(f"Loss: {loss.item():.4f} | Val: {avg_vl:.4f}")
 
-                history['eval_steps'].append(i)
-                history['layer_entropies'].append(mean_heads(report['shannon_entropy']))
-                history['layer_markov_scores'].append(mean_heads(report['markov_score_t1']))
-                
-                if report['syntax_entropy']:
-                     history['layer_syntax_entropies'].append(mean_heads(report['syntax_entropy']))
-            
-            model.train() # 切回訓練模式
-
-    # --- End of Training ---
-    print("\nTraining Finished. Saving plots...")
-    save_experiment_results(history, SAVE_DIR)
+    print("Saving..."); save_plots(history, args)
 
 if __name__ == '__main__':
     main()

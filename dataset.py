@@ -1,214 +1,450 @@
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 import torch.distributions as dist
 import numpy as np
+import logging
+import os
+
+# ==========================================
+# 1. Base Class & Simple Generators
+# ==========================================
 
 class SyntheticGenerator:
     def __init__(self, vocab_size, block_size):
-        self.vocab_size = vocab_size # number of unique tokens
-        self.block_size = block_size # length of a sample
+        self.vocab_size = vocab_size
+        self.block_size = block_size
     def generate(self):
+        """Should return either a Tensor (seq) or a Dict {'x': seq, ...}"""
         raise NotImplementedError
 
 class IIDGenerator(SyntheticGenerator):
     def generate(self):
         return torch.randint(0, self.vocab_size, (self.block_size + 1,))
 
+class HMMGenerator(SyntheticGenerator):
+    """
+    HMM Generator based on Xie et al. (2022) Appendix F (GINC Dataset).
+    
+    Structure:
+    - Latent States z_t in {0, ..., n_states-1} (Concepts)
+    - Observed Tokens x_t in {0, ..., vocab_size-1} (Words)
+    - Transition Matrix A (n_states x n_states): P(z_t | z_{t-1})
+    - Emission Matrix B (n_states x vocab_size): P(x_t | z_t)
+    
+    Parameters:
+        n_states: Number of latent concepts (default 5 in GINC).
+        trans_alpha: Dirichlet concentration for Transition Matrix.
+                     - Low val (<1): Deterministic transitions (structured).
+                     - High val (>1): Uniform transitions.
+        emit_alpha: Dirichlet concentration for Emission Matrix.
+                     - Low val (<1): Sparse emissions (each concept maps to few words).
+                     - High val (>1): Noisy emissions.
+        consistency (bool):
+            - True: Fixed A and B for the whole dataset (Language Modeling).
+            - False: Sample new A and B for EACH sequence (In-Context Learning).
+    """
+    def __init__(self, vocab_size, block_size, n_states=5, 
+                 trans_alpha=1.0, emit_alpha=1.0, consistency=False):
+        super().__init__(vocab_size, block_size)
+        self.n_states = n_states
+        self.trans_alpha = trans_alpha
+        self.emit_alpha = emit_alpha
+        self.consistency = consistency
+        
+        # Dirichlet Priors
+        self.trans_prior = torch.full((n_states,), trans_alpha)
+        self.emit_prior = torch.full((vocab_size,), emit_alpha)
+        
+        # Global Parameters (if consistency=True)
+        self.global_A = None
+        self.global_B = None
+        
+        if self.consistency:
+            self._init_global_params()
+
+    def _init_global_params(self):
+        # Sample Transition Matrix A
+        trans_sampler = dist.Dirichlet(self.trans_prior)
+        self.global_A = trans_sampler.sample((self.n_states,))
+        
+        # Sample Emission Matrix B
+        emit_sampler = dist.Dirichlet(self.emit_prior)
+        self.global_B = emit_sampler.sample((self.n_states,))
+
+    def generate(self):
+        # 1. Determine Parameters for this sequence
+        if self.consistency:
+            A = self.global_A
+            B = self.global_B
+        else:
+            # ICL Mode: Sample new HMM for this document
+            A = dist.Dirichlet(self.trans_prior).sample((self.n_states,))
+            B = dist.Dirichlet(self.emit_prior).sample((self.n_states,))
+        
+        # 2. Compute Stationary Distribution (pi) for x1
+        # P^50 trick to find steady state
+        A_limit = torch.matrix_power(A, 50)
+        pi = A_limit[0]
+        
+        # 3. Generate Sequence
+        seq_x = []
+        seq_z = [] # Hidden states
+        
+        # Initial State
+        z_t = torch.multinomial(pi, 1).item()
+        seq_z.append(z_t)
+        
+        # Initial Emission
+        x_t = torch.multinomial(B[z_t], 1).item()
+        seq_x.append(x_t)
+        
+        for _ in range(self.block_size):
+            # Transition z_{t-1} -> z_t
+            probs_z = A[z_t]
+            z_t = torch.multinomial(probs_z, 1).item()
+            seq_z.append(z_t)
+            
+            # Emission z_t -> x_t
+            probs_x = B[z_t]
+            x_t = torch.multinomial(probs_x, 1).item()
+            seq_x.append(x_t)
+            
+        # Return Dict
+        # 注意：我們回傳 A 和 B (Oracle Params) 讓你有機會算 Oracle Loss
+        return {
+            'x': torch.tensor(seq_x, dtype=torch.long),
+            's': torch.tensor(seq_z, dtype=torch.long), # Hidden States
+            'A': A, # Transition Matrix
+            'B': B  # Emission Matrix
+        }
+
 class MarkovGenerator(SyntheticGenerator):
     """
-    通用隨機 Markov Generator。
-    不再假設 i -> i+1。而是隨機採樣一個 Transition Matrix。
-    
-    參數:
-        alpha (float): Dirichlet 分佈的濃度參數 (Concentration Parameter)。
-            - alpha < 1.0 (例如 0.1): 極度稀疏。每個狀態只會跳去極少數的特定狀態 (Deterministic)。
-            - alpha = 1.0: 均勻隨機。每個轉移機率都是隨機的 (Uniform over simplex)。
-            - alpha > 1.0: 趨向平均。每個狀態跳去哪裡的機率都差不多 (High Entropy)。
+    Static Markov Chain: The Transition Matrix is fixed for the whole dataset.
+    This tests "Weights Learning" (memorization).
     """
     def __init__(self, vocab_size, block_size, alpha=0.1):
         super().__init__(vocab_size, block_size)
-        
-        # 1. 使用 Dirichlet 分佈生成隨機的 Transition Matrix
-        # 形狀: (vocab_size, vocab_size)
-        # 每一列 (Row i) 代表 P(Next | Curr=i)，且總和為 1
-        
-        # 設定 Dirichlet 的參數向量 (全為 alpha)
         dirichlet_params = torch.full((vocab_size,), alpha)
-        
-        # 採樣矩陣
-        # PyTorch 的 Dirichlet 可以接受 batch_shape，所以我們生成 vocab_size 個分佈
         sampler = dist.Dirichlet(dirichlet_params)
-        self.trans_mat = sampler.sample((vocab_size,))
+        self.trans_mat = sampler.sample((vocab_size,)) # Fixed P
         
-        # 除錯用：印出矩陣的 Entropy 平均值，讓你知道這個規則有多難
-        avg_entropy = -(self.trans_mat * torch.log(self.trans_mat + 1e-9)).sum(dim=1).mean()
-        print(f"Initialized General Markov Matrix with alpha={alpha}")
-        print(f"Average Row Entropy: {avg_entropy:.4f} (Theoretical Loss Lower Bound)")
-
     def generate(self):
         seq = [torch.randint(0, self.vocab_size, (1,)).item()]
         for _ in range(self.block_size):
             prev = seq[-1]
-            
-            # 根據當前狀態的 Row 進行多項式分佈採樣
             probs = self.trans_mat[prev]
             next_token = torch.multinomial(probs, 1).item()
             seq.append(next_token)
-            
         return torch.tensor(seq, dtype=torch.long)
 
+class EdelmanICLMCGenerator(SyntheticGenerator):
+    """
+    In-Context Learning Markov Chain (ICL-MC) from Edelman et al. (2024).
+    Dynamic Markov Chain: A NEW Transition Matrix is sampled for EACH sequence.
+    This tests "In-Context Learning" (induction).
+    """
+    def __init__(self, vocab_size, block_size, alpha=1.0):
+        super().__init__(vocab_size, block_size)
+        self.alpha = alpha
+        self.dirichlet_params = torch.full((vocab_size,), alpha)
+
+    def generate(self):
+        # 1. Sample P for THIS sequence
+        sampler = dist.Dirichlet(self.dirichlet_params)
+        P = sampler.sample((self.vocab_size,))
+        
+        # 2. Compute Stationary Distribution (pi) to sample x1
+        # P^50 converges to stationary distribution
+        P_limit = torch.matrix_power(P, 50) 
+        pi = P_limit[0]
+        
+        seq = [torch.multinomial(pi, 1).item()]
+        
+        # 3. Generate sequence
+        for _ in range(self.block_size):
+            prev = seq[-1]
+            probs = P[prev]
+            next_token = torch.multinomial(probs, 1).item()
+            seq.append(next_token)
+            
+        return {
+            'x': torch.tensor(seq, dtype=torch.long),
+            'P': P # Return the oracle P for this specific sequence
+        }
+
+# ==========================================
+# 2. HMM-LDA Generators (Synthetic & Fitted)
+# ==========================================
 
 class HMMLDAGenerator(SyntheticGenerator):
     """
-    Strict implementation of HMM-LDA generative process (Figure 1).
-    
-    Structure:
-    - n_states: HMM 總狀態數。
-    - topic_state_idx: 設定哪一個狀態是 s_topic (通常設為最後一個)。
-    - n_topics: LDA 的主題數。
+    Standard HMM-LDA Generator with synthetic random parameters.
     """
-    def __init__(self, vocab_size, block_size, n_states=5, n_topics=3, alpha_lda=0.5):
+    def __init__(self, vocab_size, block_size, n_states=5, n_topics=3, alpha_lda=0.5, n_func_words=None):
         super().__init__(vocab_size, block_size)
         self.n_states = n_states
         self.n_topics = n_topics
-        self.topic_state_idx = n_states - 1 # 設定最後一個狀態為 "Topic State"
+        self.topic_state_idx = n_states - 1 
         
-        # --- 1. HMM Parameters (Syntactic Backbone) ---
-        # pi: Transition Matrix (s_{i-1} -> s_i)
-        # 讓狀態之間有轉移規則，例如 冠詞 -> 名詞
+        # HMM Params
         self.trans_mat = torch.rand(n_states, n_states)
         self.trans_mat = self.trans_mat / self.trans_mat.sum(dim=1, keepdim=True)
         
-        # gamma: Syntactic Emission (s_i -> w_i when s != s_topic)
-        # 這些是 "HMM 字典"，通常只包含 Function words
-        # 為了模擬真實情況，我們限制這些狀態只能生成 vocab 的前 20 個字
         self.syntactic_emission = torch.zeros(n_states, vocab_size)
-        n_func_words = min(20, vocab_size // 2)
+        if not n_func_words:
+            n_func_words = min(20, vocab_size // (n_topics + 1))
+            self.n_func_words = n_func_words
+        else:
+            self.n_func_words = n_func_words
         self.syntactic_emission[:, :n_func_words] = torch.rand(n_states, n_func_words)
         self.syntactic_emission = self.syntactic_emission / self.syntactic_emission.sum(dim=1, keepdim=True)
         
-        # --- 2. LDA Parameters (Semantic Content) ---
-        # beta: Topic Word Distributions (z -> w)
-        # 這些是 "LDA 字典"，通常包含 Content words
+        # LDA Params
         self.topic_emission = torch.zeros(n_topics, vocab_size)
-        # 讓不同 Topic 偏好不同的字 (從 n_func_words 之後開始選)
         self.topic_emission[:, n_func_words:] = torch.rand(n_topics, vocab_size - n_func_words)
-        # 增加區別度：讓 Topic k 偏好特定的區間
         section = (vocab_size - n_func_words) // n_topics
         for k in range(n_topics):
             start = n_func_words + k * section
             end = start + section
-            self.topic_emission[k, start:end] += 5.0 # Boost
-            
+            self.topic_emission[k, start:end] += 5.0
         self.topic_emission = self.topic_emission / self.topic_emission.sum(dim=1, keepdim=True)
         
-        # Dirichlet Parameter for document topic distribution
         self.alpha_vec = torch.full((n_topics,), alpha_lda)
 
     def generate(self):
-        # --- Step 1: Document Level ---
-        # Draw topic weights theta^d from Dirichlet(alpha)
-        theta_d = dist.Dirichlet(self.alpha_vec).sample() # 每一個文章有一個 distribution on topic
-        
-        # --- Step 2: Sequence Level ---
+        theta_d = dist.Dirichlet(self.alpha_vec).sample()
         seq = []
-        hidden_states = [] # s_i sequence (for analysis)
-        topics = []        # z_i sequence (for analysis)
-        
-        # Initial State
+        hidden_states = []
+        topics = []
         current_state = np.random.choice(self.n_states)
         
-        # Loop for words
         for _ in range(self.block_size):
-            # b. Draw state s_i from Multinomial(pi^{s_{i-1}})
-            # (HMM Transition)
+            # Transition
             probs_s = self.trans_mat[current_state]
             current_state = torch.multinomial(probs_s, 1).item()
             hidden_states.append(current_state)
             
-            # a. Draw topic z_i from Multinomial(theta^d)
-            # (注意：圖中 z_i 是針對每個字抽的)
+            # Topic assignment
             z_i = torch.multinomial(theta_d, 1).item()
-            topics.append(z_i) # 每個字會抽到一個 topic
+            topics.append(z_i)
             
-            # c. Draw word w_i
+            # Emission
             if current_state == self.topic_state_idx:
-                # Case: s_i = s_topic -> Use LDA Dictionary (beta^{z_i})
                 word_probs = self.topic_emission[z_i]
             else:
-                # Case: s_i != s_topic -> Use HMM Dictionary (gamma^{s_i})
                 word_probs = self.syntactic_emission[current_state]
                 
             w_i = torch.multinomial(word_probs, 1).item()
             seq.append(w_i)
             
-        # 回傳完整資訊以供分析
         return {
             'x': torch.tensor(seq, dtype=torch.long),
-            's': torch.tensor(hidden_states, dtype=torch.long), # HMM States
-            'z': torch.tensor(topics, dtype=torch.long),        # Topics
-            'theta': theta_d                                    # Doc Topic Dist
+            's': torch.tensor(hidden_states, dtype=torch.long),
+            'z': torch.tensor(topics, dtype=torch.long),
+            'theta': theta_d
         }
 
+# --- Gibbs Sampler Implementation for Fitting ---
 
-class EdelmanMarkovGenerator(SyntheticGenerator):
+def categorical(proportions):
+    proportions = np.maximum(proportions, 0)
+    total = np.sum(proportions)
+    if total == 0: return np.random.randint(0, proportions.size)
+    draw = np.random.uniform(0, total)
+    for idx, cumsum in enumerate(np.cumsum(proportions)):
+        if draw < cumsum: return idx
+    return proportions.size - 1
+
+class HMMLDAGibbsSampler:
     """
-    Implementation based on 'Evolution of Statistical Induction Heads' (Edelman et al., 2024).
-    
-    Key Features:
-    1. Sequence-Specific Rules: 每條 sequence 隨機生成一個 mapping (token -> next_token)。
-    2. Alpha Parameter: 控制 statistical dependency 的強度。
-    
-    Params:
-        alpha (float): Probability of following the bigram rule. 
-                       If 1.0, strict deterministic sequence.
-                       If 0.0, completely random (IID).
-        consistency (bool): 
-            If True: Use one Global Rule for ALL sequences (Language Modeling task).
-            If False: Sample a NEW Rule for EACH sequence (In-Context Learning task).
+    Gibbs Sampler for HMM-LDA (Griffiths et al. 2004).
+    NOTE: In this sampler, Class 0 is ALWAYS the Topic State.
     """
-    def __init__(self, vocab_size, block_size, alpha=0.95, consistency=False):
-        super().__init__(vocab_size, block_size)
-        self.alpha = alpha
-        self.consistency = consistency
-        
-        # 如果是 Global Rule (consistency=True)，我們先生成好固定的 mapping
-        self.global_mapping = None
-        if self.consistency:
-            self.global_mapping = torch.randperm(vocab_size)
+    def __init__(self, vocab_size, num_topics, num_classes, alpha=0.1, beta=0.01, gamma=0.1, delta=0.1):
+        self.vocab_size = vocab_size
+        self.num_topics = num_topics
+        self.num_classes = num_classes
+        self.alpha = alpha; self.beta = beta; self.gamma = gamma; self.delta = delta
+        self.documents = []
+        self.topic_assignments = []; self.class_assignments = []
 
-    def generate(self):
-        # 1. 決定這條 sequence 的規則 (Mapping)
-        # Mapping[i] = j 代表：看到 token i，下一個應該接 token j
-        if self.consistency:
-            mapping = self.global_mapping
-        else:
-            # ICL 模式：每條數據的規則都不一樣，強迫模型看 context
-            mapping = torch.randperm(self.vocab_size)
-            
-        # 2. 生成序列
-        # 先隨機選第一個字
-        seq = [torch.randint(0, self.vocab_size, (1,)).item()]
-        
-        for _ in range(self.block_size):
-            prev_token = seq[-1]
-            
-            # 決定是否遵守規則
-            # random.random() < alpha -> 遵守
-            if np.random.random() < self.alpha:
-                # 查表：找出這條規則規定的下一個字
-                next_token = mapping[prev_token].item()
-            else:
-                # 雜訊：隨機生成一個字
-                next_token = torch.randint(0, self.vocab_size, (1,)).item()
-                
-            seq.append(next_token)
-            
-        return torch.tensor(seq, dtype=torch.long)
+    def add_document(self, doc):
+        if isinstance(doc, torch.Tensor): doc = doc.cpu().numpy()
+        self.documents.append(doc)
 
+    def initialize(self):
+        self.topic_assignments = [np.random.randint(0, self.num_topics, size=d.size) for d in self.documents]
+        self.class_assignments = [np.random.randint(0, self.num_classes, size=d.size) for d in self.documents]
+        self.run_counts()
+
+    def run_counts(self):
+        self.num_words_in_doc_assigned_to_topic = [np.zeros(self.num_topics) for _ in self.documents]
+        self.num_same_words_assigned_to_topic = np.zeros((self.vocab_size, self.num_topics))
+        self.num_words_assigned_to_topic = np.zeros(self.num_topics)
+        self.num_same_words_assigned_to_class = np.zeros((self.vocab_size, self.num_classes))
+        self.num_words_assigned_to_class = np.zeros(self.num_classes)
+        self.num_transitions = np.zeros((self.num_classes, self.num_classes))
+
+        for i, doc in enumerate(self.documents):
+            for j, word in enumerate(doc):
+                c = self.class_assignments[i][j]
+                t = self.topic_assignments[i][j]
+                self.num_words_assigned_to_class[c] += 1
+                self.num_same_words_assigned_to_class[word, c] += 1
+                if j > 0:
+                    prev = self.class_assignments[i][j-1]
+                    self.num_transitions[prev, c] += 1
+                if c == 0:
+                    self.num_words_in_doc_assigned_to_topic[i][t] += 1
+                    self.num_same_words_assigned_to_topic[word, t] += 1
+                    self.num_words_assigned_to_topic[t] += 1
+
+    def train(self, iterations=50):
+        print(f"Gibbs Fitting: {len(self.documents)} docs, {iterations} iters...")
+        for it in range(iterations):
+            for i in range(len(self.documents)):
+                for j in range(len(self.documents[i])):
+                    self.draw_class(i, j)
+                    self.draw_topic(i, j)
+
+    def draw_topic(self, i, j):
+        old_topic = self.topic_assignments[i][j]
+        old_class = self.class_assignments[i][j]
+        word = self.documents[i][j]
+        
+        props = self.num_words_in_doc_assigned_to_topic[i].copy()
+        if old_class == 0: props[old_topic] -= 1
+        props += self.alpha
+        
+        if old_class == 0:
+            num = self.num_same_words_assigned_to_topic[word].copy()
+            den = self.num_words_assigned_to_topic.copy()
+            num[old_topic] -= 1; den[old_topic] -= 1
+            props *= (num + self.beta) / (den + self.vocab_size * self.beta)
+            
+        new_topic = categorical(props)
+        self.topic_assignments[i][j] = new_topic
+        
+        if old_class == 0:
+            self.num_words_in_doc_assigned_to_topic[i][old_topic] -= 1
+            self.num_words_in_doc_assigned_to_topic[i][new_topic] += 1
+            self.num_same_words_assigned_to_topic[word, old_topic] -= 1
+            self.num_same_words_assigned_to_topic[word, new_topic] += 1
+            self.num_words_assigned_to_topic[old_topic] -= 1
+            self.num_words_assigned_to_topic[new_topic] += 1
+
+    def draw_class(self, i, j):
+        old_class = self.class_assignments[i][j]
+        old_topic = self.topic_assignments[i][j]
+        word = self.documents[i][j]
+        
+        prev = self.class_assignments[i][j-1] if j > 0 else None
+        futr = self.class_assignments[i][j+1] if j < len(self.documents[i])-1 else None
+        
+        if prev is not None:
+            t1 = self.num_transitions[prev].copy(); t1[old_class] -= 1
+        else: t1 = np.zeros(self.num_classes)
+        t1 += self.gamma
+        
+        if futr is not None:
+            t2 = self.num_transitions[:, futr].copy(); t2[old_class] -= 1
+        else: t2 = np.zeros(self.num_classes)
+        t2 += self.gamma
+        
+        num = t1 * t2
+        den = self.num_words_assigned_to_class.copy()
+        if prev is not None: den[prev] += 1
+        den += self.num_classes * self.gamma
+        
+        m_num = self.num_same_words_assigned_to_class[word].copy()
+        m_num[0] = self.num_same_words_assigned_to_topic[word, old_topic]
+        if old_class != 0: m_num[old_class] -= 1
+        else: m_num[0] -= 1
+        m_num[1:] += self.delta; m_num[0] += self.beta
+        
+        m_den = self.num_words_assigned_to_class.copy()
+        m_den[0] = self.num_words_assigned_to_topic[old_topic]
+        if old_class != 0: m_den[old_class] -= 1
+        else: m_den[0] -= 1
+        m_den[1:] += self.delta * self.vocab_size; m_den[0] += self.beta * self.vocab_size
+        
+        props = (m_num / m_den) * num / den
+        new_class = categorical(props)
+        self.class_assignments[i][j] = new_class
+        
+        if prev is not None:
+            self.num_transitions[prev, old_class] -= 1
+            self.num_transitions[prev, new_class] += 1
+        if futr is not None:
+            self.num_transitions[old_class, futr] -= 1
+            self.num_transitions[new_class, futr] += 1
+            
+        self.num_same_words_assigned_to_class[word, old_class] -= 1
+        self.num_same_words_assigned_to_class[word, new_class] += 1
+        self.num_words_assigned_to_class[old_class] -= 1
+        self.num_words_assigned_to_class[new_class] += 1
+        
+        if old_class == 0 and new_class != 0:
+            self.num_words_in_doc_assigned_to_topic[i][old_topic] -= 1
+            self.num_same_words_assigned_to_topic[word, old_topic] -= 1
+            self.num_words_assigned_to_topic[old_topic] -= 1
+        elif old_class != 0 and new_class == 0:
+            self.num_words_in_doc_assigned_to_topic[i][old_topic] += 1
+            self.num_same_words_assigned_to_topic[word, old_topic] += 1
+            self.num_words_assigned_to_topic[old_topic] += 1
+
+    def get_fitted_params(self):
+        # Normalize counts to probs
+        trans = self.num_transitions + self.gamma
+        trans /= trans.sum(axis=1, keepdims=True)
+        top_emit = self.num_same_words_assigned_to_topic.T + self.beta
+        top_emit /= top_emit.sum(axis=1, keepdims=True)
+        syn_emit = self.num_same_words_assigned_to_class.T + self.delta
+        syn_emit /= syn_emit.sum(axis=1, keepdims=True)
+        return torch.tensor(trans).float(), torch.tensor(syn_emit).float(), torch.tensor(top_emit).float()
+
+class FittedHMMLDAGenerator(HMMLDAGenerator):
+    """
+    Fits HMM-LDA on source file, then acts as a generator using learned params.
+    """
+    def __init__(self, source_file, vocab_size, block_size, n_states=5, n_topics=3):
+        # 1. Read & Tokenize
+        if not os.path.exists(source_file):
+            raise FileNotFoundError(f"Source file {source_file} not found.")
+        with open(source_file, 'r', encoding='utf-8') as f:
+            raw = f.read().split()
+        
+        # Naive tokenization mapping to vocab_size
+        tokens = [int(t) % vocab_size for t in raw if t.isdigit()] # Expects int tokens or hashes
+        if not tokens: # Fallback for real text
+             tokens = [hash(t) % vocab_size for t in raw]
+             
+        docs = [np.array(tokens[i:i+block_size]) for i in range(0, len(tokens)-block_size, block_size)]
+        
+        # 2. Fit
+        sampler = HMMLDAGibbsSampler(vocab_size, n_topics, n_states)
+        limit = min(len(docs), 500) # Limit docs for speed
+        for d in docs[:limit]: sampler.add_document(d)
+        
+        sampler.initialize()
+        sampler.train(iterations=20)
+        
+        # 3. Init Parent with Fitted Params
+        trans, syn, top = sampler.get_fitted_params()
+        super().__init__(vocab_size, block_size, n_states, n_topics)
+        
+        self.trans_mat = trans
+        self.syntactic_emission = syn
+        self.topic_emission = top
+        self.topic_state_idx = 0 # Gibbs Sampler uses 0 as topic
+
+# ==========================================
+# 3. Dataset Wrapper & Factory
+# ==========================================
 
 class SyntheticDataset(IterableDataset):
-    def __init__(self, generator, num_samples=10000):
+    def __init__(self, generator, num_samples):
         self.generator = generator
         self.num_samples = num_samples
 
@@ -216,65 +452,78 @@ class SyntheticDataset(IterableDataset):
         for _ in range(self.num_samples):
             outputs = self.generator.generate()
             
-            # --- 1. 標準化輸出格式 ---
+            # Format handling
             if isinstance(outputs, torch.Tensor):
-                # 簡單版 Generator (IID, Simple Markov)
                 full_seq = outputs
-                extra_info = {} # 沒有 Metadata
-            elif isinstance(outputs, dict):
-                # 進階版 Generator (HMM, HMM-LDA)
-                full_seq = outputs['x']
-                # 把 x 以外的東西都當作 extra info
-                extra_info = {k: v for k, v in outputs.items() if k != 'x'}
+                extra_info = {}
             else:
-                raise ValueError("Generator output type not supported")
+                full_seq = outputs['x']
+                extra_info = {k: v for k, v in outputs.items() if k != 'x'}
 
-            # --- 2. 製作 Causal LM 的 Input/Target ---
-            # Input: 0 到 T-1
-            # Target: 1 到 T
+            # Create Causal Input/Target
             x = full_seq[:-1]
             y = full_seq[1:]
             
-            # --- 3. 處理 Metadata 的對齊 (關鍵!) ---
-            # 如果 generator 給了每個 token 的 state (s) 或 topic (z)
-            # 我們通常希望這些標籤能跟 Target (y) 對齊
-            # 因為我們算 Loss 或 Entropy 是針對 "預測出來的字"
-            
+            # Align Metadata: Slice sequence-length metadata to match y
             aligned_extra = {}
             for k, v in extra_info.items():
-                if k in ['s', 'z']: # 這些是 Sequence Level 的標籤，需要切片
-                    # 確保它跟 y 一樣長，代表 "產生 y[t] 的那個 state"
-                    aligned_extra[k] = v[1:] 
+                if k in ['s', 'z'] and len(v) == len(full_seq):
+                     aligned_extra[k] = v[1:] 
                 else:
-                    # 其他像是 theta (Document Level) 不用切
-                    aligned_extra[k] = v
+                     # e.g., 'theta', 'P' (Transition Matrix) stay global
+                     aligned_extra[k] = v
             
-            # 回傳三個東西：輸入，目標，額外資訊
             yield x, y, aligned_extra
+            
+    def __len__(self):
+        return self.num_samples
 
-# Factory 更新
-def get_dataset(type_name, vocab_size, block_size, **kwargs):
-    if type_name == 'iid':
-        gen = IIDGenerator(vocab_size, block_size)
-        
-    elif type_name == 'markov':
-        # 這是舊版的全域 Markov
-        gen = MarkovGenerator(vocab_size, block_size, **kwargs)
-        
-    elif type_name == 'edelman_markov':
-        # 這是新版，支援 ICL 測試
-        alpha = kwargs.get('alpha', 0.95)
-        consistency = kwargs.get('consistency', False) # 預設為 False (ICL Mode)
-        gen = EdelmanMarkovGenerator(vocab_size, block_size, alpha=alpha, consistency=consistency)
-        
-    elif type_name == 'hmm':
-        # ... (HMM logic)
-        gen = HMMGenerator(vocab_size, block_size, **kwargs)
+class DataFactory:
+    @staticmethod
+    def get_loaders(args):
+        """
+        Parses argparse args and returns (train, val, test) loaders.
+        """
+        # 1. Select Generator
+        if args.data_type == 'iid':
+            gen = IIDGenerator(args.vocab_size, args.block_size)
+        elif args.data_type == 'markov':
+            gen = MarkovGenerator(args.vocab_size, args.block_size)
 
-    elif type_name == 'hmm_lda':
-        gen = HMMLDAGenerator(vocab_size, block_size, **kwargs)
-        
-    else:
-        raise ValueError(f"Unknown type: {type_name}")
-    
-    return SyntheticDataset(gen)
+        elif args.data_type == 'hmm':
+            # 這是 Xie et al. (2022) 的 HMM Generator
+            # 預設參數可以模擬 GINC (n_states=5)
+            # 這裡我們假設 consistency=True (Language Modeling) 或 False (ICL)
+            # 你可以加一個 argparse 參數 --consistency 來控制，這裡先預設 False (ICL)
+            gen = HMMGenerator(
+                vocab_size=args.vocab_size, 
+                block_size=args.block_size, 
+                n_states=args.n_states,
+                trans_alpha=0.1,  # 較低的 alpha 讓轉移比較有結構 (Structure)
+                emit_alpha=0.1,   # 較低的 alpha 讓 emission 比較稀疏 (Concept 明確)
+                consistency=False # 預設做 In-Context Learning
+                )
+
+        elif args.data_type == 'edelman_icl':
+            # Note: ICL works best with small vocab (e.g., 3)
+            gen = EdelmanICLMCGenerator(args.vocab_size, args.block_size, alpha=1.0)
+        elif args.data_type == 'hmm_lda':
+            gen = HMMLDAGenerator(args.vocab_size, args.block_size, 
+                                  n_states=args.n_states, n_topics=args.n_topics, n_func_words=args.n_func_words)
+        elif args.data_type == 'fitted_hmm_lda':
+            gen = FittedHMMLDAGenerator(args.source_file, args.vocab_size, args.block_size,
+                                        n_states=args.n_states, n_topics=args.n_topics)
+        else:
+            raise ValueError(f"Unknown data_type: {args.data_type}")
+
+        # 2. Wrap in Dataset
+        train_ds = SyntheticDataset(gen, args.train_samples)
+        val_ds   = SyntheticDataset(gen, args.val_samples)
+        test_ds  = SyntheticDataset(gen, args.test_samples)
+
+        # 3. Return Loaders
+        return (
+            DataLoader(train_ds, batch_size=args.batch_size),
+            DataLoader(val_ds, batch_size=args.batch_size),
+            DataLoader(test_ds, batch_size=args.batch_size)
+        )
