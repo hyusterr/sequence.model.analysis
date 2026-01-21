@@ -5,6 +5,8 @@ import numpy as np
 import logging
 import os
 
+from utils import stationary_distribution
+
 # ==========================================
 # 1. Base Class & Simple Generators
 # ==========================================
@@ -144,13 +146,16 @@ class EdelmanICLMCGenerator(SyntheticGenerator):
     Dynamic Markov Chain: A NEW Transition Matrix is sampled for EACH sequence.
     This tests "In-Context Learning" (induction).
     """
-    def __init__(self, vocab_size, block_size, alpha=1.0):
-        super().__init__(vocab_size, block_size)
-        self.alpha = alpha
+    def __init__(self, vocab_size, block_size, alpha=1.0, n_gram=2):
+        super().__init__(vocab_size, block_size) # token, sequence_len
+        self.alpha = alpha # [1, ..., 1] from paper
         self.dirichlet_params = torch.full((vocab_size,), alpha)
+        # make it a vector of [1, 1, ..., 1] of size vocab_size
+
 
     def generate(self):
         # 1. Sample P for THIS sequence
+        # each sequence has its own Markov Chain, with P ~ Dir(alpha)
         sampler = dist.Dirichlet(self.dirichlet_params)
         P = sampler.sample((self.vocab_size,))
         

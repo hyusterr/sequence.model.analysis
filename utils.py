@@ -1,6 +1,39 @@
 import torch
 import numpy as np
 
+def stationary_distribution(P):
+    if len(P.shape) == 2:
+      pi = torch.ones((1, P.size(1)), device=P.device, dtype=P.dtype) / P.size(0)
+    elif len(P.shape) == 3:
+      pi = torch.ones((P.size(0), 1, P.size(1)), device=P.device, dtype=P.dtype) / P.size(0)
+    else:
+      raise ValueError(f"P has shape {P.size()}, but P must be 2D or 3D tensor")
+    if P.size(-1) < 5:
+      P_next = torch.linalg.matrix_power(P,16)
+      # while not torch.allclose(P, P_next):
+      #   P = P_next
+      #   P_next = torch.linalg.matrix_power(P,2)
+      # print(P_next[0])
+      return P_next.mean(axis=-1)
+
+    pi_next = torch.matmul(pi, P)
+    i = 0
+    while not torch.allclose(pi_next, pi, atol = 1e-4, rtol = 1e-4):
+        i += 1
+        pi = pi_next
+        pi_next = torch.matmul(pi, P)
+        if i >= 100:
+          print("OH NO")
+          for a in range(len(pi_next)):
+            if not torch.allclose(pi_next[a], pi[a], atol = 1e-4, rtol = 1e-4):
+              print(P[a])
+              print(pi[a]-pi_next[a])
+              exit()
+          print("OH NO NO")
+          exit()
+    pi = torch.matmul(pi_next, P).squeeze()
+    return pi / pi.sum(axis=-1, keepdim=True)
+
 def compute_theoretical_entropy_rate(generator):
     if not hasattr(generator, 'trans_mat'): return None
     P = generator.trans_mat.float()

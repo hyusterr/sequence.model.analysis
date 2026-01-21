@@ -11,7 +11,7 @@ from utils import AttentionAnalyzer, compute_theoretical_entropy_rate, compute_o
 def parse_args():
     parser = argparse.ArgumentParser()
     # Data
-    parser.add_argument('--data_type', type=str, default='hmm_lda', 
+    parser.add_argument('--data_type', type=str, default='edelman_icl', 
                     choices=['iid', 'markov', 'edelman_icl', 'hmm_lda', 'fitted_hmm_lda', 'hmm'], # 加入 hmm
                     help="Type of generative process")
     parser.add_argument('--consistency', action='store_true', 
@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument('--n_head', type=int, default=4)
     parser.add_argument('--n_embd', type=int, default=128)
     parser.add_argument('--attn_only', action='store_true')
+    parser.add_argument('--min_model', type=bool, default=False)
     parser.add_argument('--use_relative_pos', action='store_true')
     # Training
     parser.add_argument('--lr', type=float, default=1e-3)
