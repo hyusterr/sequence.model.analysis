@@ -209,7 +209,7 @@ class StandardTransformer(nn.Module):
     Standard GPT-style Transformer.
     Supports config for 'attention only' or 'with MLP'.
     """
-    def __init__(self, vocab_size, d_model=64, n_layer=2, n_head=2, max_len=128, use_mlp=True, **kwargs):
+    def __init__(self, vocab_size, d_model=16, n_layer=2, n_head=1, max_len=128, use_mlp=True, **kwargs):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_len, d_model)

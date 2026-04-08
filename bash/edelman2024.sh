@@ -1,0 +1,13 @@
+python main.py \
+    --data_type edelman_icl \
+    --vocab_size 3 \
+    --block_size 100 \
+    --n_layer 2 \
+    --n_head 1 \
+    --n_embd 16 \
+    --batch_size 64 \
+    --lr 3e-5 \
+    --attn_only \
+    --use_relative_pos \
+    --train_samples 200000 \
+    --save_dir results/edelman_paper_repro

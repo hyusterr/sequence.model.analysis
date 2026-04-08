@@ -1,0 +1,14 @@
+python main.py \
+    --data_type hmm_lda \
+    --vocab_size 9 \
+    --n_topics 2 \
+    --n_states 3 \
+    --block_size 100 \
+    --n_layer 2 \
+    --n_head 2 \
+    --n_embd 64 \
+    --attn_only \
+    --use_relative_pos \
+    --train_samples 150000 \
+    --eval_interval 100 \
+    --save_dir results/micro_hmm_lda_333_150000

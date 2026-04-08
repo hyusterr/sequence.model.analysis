@@ -4,9 +4,12 @@ import os
 import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
+from copy import deepcopy
+
 from dataset import DataFactory
 from model import Transformer, TransformerConfig
 from utils import AttentionAnalyzer, compute_theoretical_entropy_rate, compute_oracle_loss
+from test_error import test_last_token
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -87,6 +90,7 @@ def main():
 
     history = {'iter': [], 'loss': [], 'val_loss': [], 'oracle': [], 'eval_steps': [], 
                'layer_entropies': [], 'layer_markov': [], 'layer_syntax': [], 'layer_topic': []}
+    model_checkpoints = [deepcopy(model)]
 
     model.train()
     step = 0
@@ -100,6 +104,7 @@ def main():
         
         step += 1
         if step % args.eval_interval == 0:
+            model_checkpoints.append(deepcopy(model.state_dict()))
             model.eval()
             with torch.no_grad():
                 # Val Loss
@@ -129,6 +134,11 @@ def main():
                 
             model.train()
             pbar.set_description(f"Loss: {loss.item():.4f} | Val: {avg_vl:.4f}")
+   
+    kl_divs = []
+    for model in model_checkpoints:
+        data = test_last_token(model, test_dl, device)
+
 
     print("Saving..."); save_plots(history, args)
 
