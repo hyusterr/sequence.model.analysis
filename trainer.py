@@ -27,13 +27,17 @@ class Trainer:
     def train_epoch(self):
         self.model.train()
         total_loss = 0
-        for x, y in self.train_loader:
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx}", leave=False)
+
+        for x, y in pbar:
             x, y = x.to(self.device), y.to(self.device)
             self.optimizer.zero_grad()
             logits, loss = self.model(x, y) # 直接使用 model 內建的 loss 計算
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
         return total_loss / len(self.train_loader)
 
     def evaluate(self):
@@ -125,12 +129,15 @@ def run_experiment():
             )
             
             trainer = Trainer(model, train_loader, train_loader, device, transition_matrix=p_matrix)
-            
-            for epoch in range(config["epochs"]):
+           
+            epoch_pbar = tqdm(range(config["epochs"]), desc="Overall Progress")
+            for epoch in epoch_pbar:
                 loss = trainer.train_epoch()
                 ce, kl = trainer.evaluate()
                 trainer.history["test_ce"].append(ce)
                 trainer.history["test_kl"].append(kl)
+
+                epoch_pbar.set_postfix(CE=f"{ce:.4f}", KL=f"{kl:.4f}")
             
             # 存圖：檔名格式如 Markov_performer.png
             trainer.save_plots(f"{data_name}_{attn}", f"results/{data_name}_{attn}")

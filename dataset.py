@@ -119,7 +119,7 @@ class HMMDataset(SequenceDataset):
         init_idx = torch.multinomial(self.stationary_hidden, 1).item()
         for k in range(self.n_order - 1, -1, -1):
             z_seq[k] = init_idx % self.num_hidden
-            init_idx //= self.hidden_hidden
+            init_idx //= self.num_hidden
 
         for t in range(self.n_order, self.seq_len + 1):
             idx = get_index_from_history(z_seq[t-self.n_order:t], self.hidden_powers)
