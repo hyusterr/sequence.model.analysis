@@ -41,24 +41,23 @@ class Trainer:
             
         return total_loss / len(self.train_loader)
 
+    # Trainer.evaluate 內部
     def evaluate(self):
         self.model.eval()
-        all_ce, all_kl = [], []
+        all_kl = []
         with torch.no_grad():
-            # 這裡我們用 train_loader 代替 test，因為實驗重點在於模型是否能擬合分佈
-            for x, y in self.train_loader:
-                x, y = x.to(self.device), y.to(self.device)
+            for batch in self.train_loader:
+                # 現在每個 dataset 都回傳 (x, y, target_dist)
+                x, y, target_dist = batch
+                x, y, target_dist = x.to(self.device), y.to(self.device), target_dist.to(self.device)
+            
                 logits, _ = self.model(x)
-                
-                ce = compute_cross_entropy(logits, y)
-                all_ce.append(ce)
-                
-                # 只有在有固定 P 矩陣時才計算 KL (Markov 專用)
-                if self.transition_matrix is not None:
-                    kl = compute_kl_divergence(logits, x, self.transition_matrix.to(self.device))
-                    all_kl.append(kl)
-        
-        return np.mean(all_ce), (np.mean(all_kl) if all_kl else 0.0)
+            
+                # 直接把正確答案餵進去算 KL
+                kl = compute_kl_divergence(logits, target_dist)
+                all_kl.append(kl)
+        return np.mean(all_kl)
+
 
     def save_plots(self, title, filename):
         epochs = range(1, len(self.history["test_ce"]) + 1)

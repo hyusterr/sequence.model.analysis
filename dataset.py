@@ -113,27 +113,40 @@ class HMMDataset(SequenceDataset):
         self.hidden_powers = self.num_hidden ** torch.arange(self.n_order - 1, -1, -1)
         self.stationary_hidden = get_stationary_distribution(self.A, self.n_order, self.num_hidden)
 
-    def generate_sequence(self) -> torch.Tensor:
-        # 1. 先生成隱藏狀態序列 Z
-        z_seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
-        init_idx = torch.multinomial(self.stationary_hidden, 1).item()
-        for k in range(self.n_order - 1, -1, -1):
-            z_seq[k] = init_idx % self.num_hidden
-            init_idx //= self.num_hidden
+    # HMMDataset 內部的 generate_sequence 邏輯
+    def generate_sequence(self):
+        z_seq = [] # 隱藏狀態
+        s_seq = [] # 觀測值
+        target_probs = [] # 理論最優分佈
 
-        for t in range(self.n_order, self.seq_len + 1):
-            idx = get_index_from_history(z_seq[t-self.n_order:t], self.hidden_powers)
-            z_seq[t] = torch.multinomial(self.A[idx], 1).item()
+        # 1. 抽樣第一個隱藏狀態 z1
+        curr_z = torch.multinomial(self.stationary_hidden, 1).item()
+    
+        for t in range(self.seq_len):
+            z_seq.append(curr_z)
         
-        # 2. 根據隱藏序列 Z，透過發射矩陣 B 生成觀測序列 X
-        x_seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
-        for t in range(self.seq_len + 1):
-            current_z = z_seq[t]
-            x_seq[t] = torch.multinomial(self.B[current_z], 1).item()
-            
-        return x_seq
+            # 當前 z_t 對應的發射機率分佈，這就是 Transformer 應該要猜中的答案
+            # 注意：這是對應「即將生成的 s_t」的分佈
+            target_probs.append(self.B[curr_z]) 
+        
+            # 2. 根據 curr_z 生成觀測值 s_t
+            curr_s = torch.multinomial(self.B[curr_z], 1).item()
+            s_seq.append(curr_s)
+        
+            # 3. 轉移到下一個隱藏狀態 z_{t+1}
+            curr_z = torch.multinomial(self.A[curr_z], 1).item()
 
+        # 回傳時，target_probs 的 shape 會是 [seq_len, vocab_size]
+        return torch.tensor(s_seq), torch.stack(target_probs)
 
+    def __getitem__(self, idx):
+        s_seq, target_probs = self.generate_sequence()
+        x = s_seq[:-1] # 輸入
+        y = s_seq[1:]  # 標籤
+        # 我們要預測的是 y，所以 target_probs 也要對齊 y 的時間點
+        target_dist = target_probs[1:] 
+    
+        return x, y, target_dist 
       
 
 
