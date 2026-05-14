@@ -14,11 +14,11 @@ from model import Transformer
 from metrics import compute_kl_divergence, compute_cross_entropy
 
 class Trainer:
-    def __init__(self, model, train_loader, device, transition_matrix=None):
+    def __init__(self, model, train_loader, device, transition_matrix=None, lr=3e-5):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.device = device
-        self.optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
         self.transition_matrix = transition_matrix
         # 儲存歷史數據
         self.history = {"test_ce": [], "test_kl": []}
@@ -26,66 +26,79 @@ class Trainer:
     def train_epoch(self, epoch_idx, model_name):
         self.model.train()
         total_loss = 0
-        # 內層進度條：顯示每個 Batch 的訓練狀況
         pbar = tqdm(self.train_loader, desc=f"  {model_name} Epoch {epoch_idx}", leave=False)
         
-        for x, y in pbar:
-            x, y = x.to(self.device), y.to(self.device)
+        for x, y, p_true in pbar: # 確保領取 p_true
+            x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
+            
             self.optimizer.zero_grad()
-            logits, loss = self.model(x, y) # 使用 model 內建的 loss 計算
+            logits, loss = self.model(x, y)
             loss.backward()
             self.optimizer.step()
             
-            total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            # --- 新增：每個 Step 記錄一次 ---
+            # 這裡的 loss 就是當前 batch 的 Cross Entropy
+            current_ce = loss.item()
+            
+            # 計算當前 batch 的 KL
+            # 注意：這裡呼叫你修正過量級（除以 B*T）後的 compute_kl_divergence
+            current_kl = compute_kl_divergence(logits, p_true)
+            
+            self.history["test_ce"].append(current_ce)
+            self.history["test_kl"].append(current_kl)
+            # ------------------------------
+
+            total_loss += current_ce
+            pbar.set_postfix(CE=f"{current_ce:.4f}", KL=f"{current_kl:.4f}")
             
         return total_loss / len(self.train_loader)
 
     # Trainer.evaluate 內部
     def evaluate(self):
         self.model.eval()
-        all_kl = []
+        all_ce, all_kl = [], []
         with torch.no_grad():
-            for batch in self.train_loader:
-                # 現在每個 dataset 都回傳 (x, y, target_dist)
-                x, y, target_dist = batch
-                x, y, target_dist = x.to(self.device), y.to(self.device), target_dist.to(self.device)
-            
+            for x, y, p_true in self.train_loader: # 注意這裡多領一個 p_true
+                x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
                 logits, _ = self.model(x)
-            
-                # 直接把正確答案餵進去算 KL
-                kl = compute_kl_divergence(logits, target_dist)
+                
+                ce = compute_cross_entropy(logits, y)
+                all_ce.append(ce)
+                
+                # 直接傳入 p_true 算 KL
+                kl = compute_kl_divergence(logits, p_true)
                 all_kl.append(kl)
-        return np.mean(all_kl)
+        
+        return np.mean(all_ce), np.mean(all_kl)
 
-
-    def save_plots(self, title, filename):
-        epochs = range(1, len(self.history["test_ce"]) + 1)
+    def save_plots(self, title, filename, config):
+        # 橫軸改為總步數
+        total_steps = len(self.history["test_ce"])
+        steps = range(1, total_steps + 1)
+        
+        # 如果你想對標論文的 "Examples Seen (Thousands)"
+        # examples_seen = [i * config["batch_size"] / 1000 for i in steps]
+        
         fig, ax1 = plt.subplots(figsize=(10, 6))
 
-        # Cross Entropy 藍線
-        color = 'tab:blue'
-        ax1.set_xlabel('Epochs')
-        ax1.set_ylabel('Cross Entropy', color=color)
-        ax1.plot(epochs, self.history["test_ce"], color=color, label='CE', marker='o', linewidth=1.5)
-        ax1.tick_params(axis='y', labelcolor=color)
-
-        # KL Divergence 紅線 (使用雙軸，因為量級不同)
+        # Cross Entropy
+        ax1.set_xlabel('Steps (Iterations)')
+        ax1.set_ylabel('Cross Entropy', color='tab:blue')
+        ax1.plot(steps, self.history["test_ce"], color='tab:blue', alpha=0.6, label='CE')
+        
+        # KL Divergence
         ax2 = ax1.twinx()
-        color = 'tab:red'
-        ax2.set_ylabel('KL Divergence', color=color)
-        # 避免 KL 為 0 時 Y 軸標籤出現負數
-        if all(v == 0 for v in self.history["test_kl"]):
-            ax2.set_ylim(-0.1, 1.0) 
-        ax2.plot(epochs, self.history["test_kl"], color=color, label='KL', marker='x', linestyle='--', linewidth=1.5)
-        ax2.tick_params(axis='y', labelcolor=color)
+        ax2.set_ylabel('KL Divergence', color='tab:red')
+        ax2.plot(steps, self.history["test_kl"], color='tab:red', alpha=0.8, label='KL')
 
-        plt.title(f"Training Metrics: {title}")
+        plt.title(f"Step-level Metrics: {title}")
         fig.tight_layout()
-        plt.grid(True, alpha=0.3)
         plt.savefig(f"{filename}.png", dpi=300)
         plt.close()
 
+    
+
+    
 # ==========================================
 # 實驗啟動流程
 # ==========================================
@@ -103,13 +116,13 @@ def run_experiment():
         "n_order": 1,
         "embed_dim": 16, 
         "num_heads": 2, 
-        "epochs": 20, 
-        "batch_size": 32
+        "epochs": 100, 
+        "batch_size": 64
     }
 
-    dataset_names = ["Markov", "ICL-Markov", "HMM"]
-    layer_options = [1, 2] # 1層與2層比較
-    attn_types = ["attention-only", "standard", "linear", "performer"]
+    dataset_names = ["ICL-Markov"] #, "HMM", "Markov"]
+    layer_options = [2, 1] # 1層與2層比較
+    attn_types = ["attention-only", "standard", "linear"] #, "performer"]
 
     for data_name in dataset_names:
         print(f"\n" + "="*50)
@@ -120,11 +133,14 @@ def run_experiment():
         if data_name == "Markov":
             ds = MarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"])
         elif data_name == "ICL-Markov":
-            ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"])
+            train_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"])
+            test_ds = test_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], virtual_size=128)
         else:
             ds = HMMDataset(config["seq_len"], num_hidden=2, num_obs=config["num_symbols"])
 
-        train_loader = DataLoader(ds, batch_size=config["batch_size"])
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"])
+        test_loader = DataLoader(test_ds, batch_size=128) # 一次跑完 128 條取平均
+
         p_matrix = getattr(ds, 'P', None) # 取得 Markov 的固定轉移矩陣
 
         for n_layer in layer_options:
