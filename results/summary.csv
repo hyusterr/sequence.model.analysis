@@ -1,0 +1,7 @@
+Model,Final_CE,Final_KL
+ICL-Markov_L2_attention-only,1.049871,0.202446
+ICL-Markov_L2_standard,1.009119,0.190494
+ICL-Markov_L2_linear,1.026825,0.188285
+ICL-Markov_L1_attention-only,1.041394,0.200859
+ICL-Markov_L1_standard,1.042186,0.202658
+ICL-Markov_L1_linear,1.022197,0.202202
