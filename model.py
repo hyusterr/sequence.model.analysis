@@ -32,16 +32,18 @@ class MultiHeadAttention(nn.Module):
         self.d_model, self.nhead, self.attn_type, self.pe_type = d_model, nhead, attn_type, pe_type
         self.head_dim = d_model // nhead
 
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.c_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False) # W_Q
+        self.k_proj = nn.Linear(d_model, d_model, bias=False) # W_K
+        self.v_proj = nn.Linear(d_model, d_model, bias=False) # W_V
+        self.c_proj = nn.Linear(d_model, d_model, bias=False) # W_O
         
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
         # 標準 Mask 與 Edelman RPE 初始化 (同前版本)
         self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+        # register causal masking
+
         if pe_type == 'rpe':
             self.wpe_rel = nn.Embedding(block_size + 1, d_model, padding_idx=block_size)
             pos = torch.arange(block_size).unsqueeze(0); pos = pos.view(-1, 1) - pos.view(1, -1)
@@ -51,9 +53,34 @@ class MultiHeadAttention(nn.Module):
         # --- Performer 專屬：隨機投影矩陣 (FAVOR+) ---
         if attn_type == 'performer':
             # 投影維度 m 通常設為 head_dim 的幾倍，這裡取 1:1 簡化
-            m = self.head_dim 
-            projection_matrix = torch.randn(m, self.head_dim)
+            # m = self.head_dim
+            # projection_matrix = self._create_orthogonal_projection(m, self.head_dim) 
+            # ref: performer_pytorch / original paper
+            m = int(self.head_dim * math.log(self.head_dim))
+            projection_matrix = self._create_orthogonal_projection(m, self.head_dim)
             self.register_buffer("projection_matrix", projection_matrix)
+
+    def _create_orthogonal_projection(self, m, d):
+        # 模仿官方 gaussian_orthogonal_random_matrix 的簡化邏輯
+        # 我們需要 m 行 d 列
+        nb_full_blocks = m // d
+        blocks = []
+        
+        for _ in range(nb_full_blocks):
+            # 生成正交矩陣 (QR 分解)
+            q, r = torch.linalg.qr(torch.randn(d, d))
+            blocks.append(q) # q 是正交的
+            
+        remaining_rows = m - nb_full_blocks * d
+        if remaining_rows > 0:
+            q, r = torch.linalg.qr(torch.randn(d, d))
+            blocks.append(q[:remaining_rows])
+            
+        final_matrix = torch.cat(blocks)
+        
+        # 官方還會乘以一個隨機的 Norm (multiplier)，讓它符合高斯分佈的長度
+        multiplier = torch.randn(m, d).norm(dim=1, keepdim=True)
+        return final_matrix * multiplier
 
     def forward(self, x):
         B, T, C = x.size()

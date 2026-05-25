@@ -12,19 +12,20 @@ def compute_cross_entropy(logits, targets):
     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
     return loss.item()
 
-
 def compute_kl_divergence(logits, target_probs):
     """
-    logits: [batch_size, T-1, V]
-    target_probs: [batch_size, T-1, V] (從 Dataset 傳來的正確答案)
+    logits: [batch_size, seq_len, vocab_size]
+    target_probs: [batch_size, seq_len, vocab_size] 
     """
-    # 轉為 log 空間
+    # 1. 確保 logits 轉為 log 空間
     log_pred_probs = F.log_softmax(logits, dim=-1)
     
-    # 計算 KL (P || Q) = P * (log P - log Q)
-    # 加上 eps 避免 log(0)
-    eps = 1e-10
-    kl = target_probs * (torch.log(target_probs + eps) - log_pred_probs)
+    # 2. 使用 'sum' 再手動除以所有元素的總數 (B * T)
+    # 或是維持 'batchmean' 但要再除以序列長度
+    kl_sum = F.kl_div(log_pred_probs, target_probs, reduction='sum')
     
-    # 回傳平均每個 token 的 KL
-    return kl.sum() / (target_probs.size(0) * target_probs.size(1))
+    # 計算平均每個 token 的 KL
+    batch_size, seq_len, _ = logits.size()
+    avg_kl = kl_sum / (batch_size * seq_len)
+    
+    return avg_kl.item()

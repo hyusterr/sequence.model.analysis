@@ -33,10 +33,14 @@ class SequenceDataset(Dataset):
         raise NotImplementedError
 
     def __getitem__(self, idx):
-        full_seq = self.generate_sequence()
+        # generate_sequence 現在必須回傳 (序列, 真實轉移分佈)
+        full_seq, target_probs = self.generate_sequence() 
         x = full_seq[:-1]
         y = full_seq[1:]
-        return x, y
+        # target_probs 也切掉最後一個，對應預測目標
+        # target_probs shape: [seq_len, num_symbols]
+        return x, y, target_probs[:-1]
+
 
 # ==========================================
 # 1. MarkovChainDataset (ICLR 2025 固定設定)
@@ -54,41 +58,55 @@ class MarkovChainDataset(SequenceDataset):
         self.P = self.dirichlet.sample((num_states,))
         self.stationary_prob = get_stationary_distribution(self.P, self.n_order, self.num_symbols)
 
-    def generate_sequence(self) -> torch.Tensor:
+    def generate_sequence(self) -> tuple:
         seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
-        # 起點抽樣
+        # 建立儲存真理機率的 Tensor [seq_len + 1, num_symbols]
+        true_probs_seq = torch.zeros(self.seq_len + 1, self.num_symbols)
+        
         init_idx = torch.multinomial(self.stationary_prob, 1).item()
         for k in range(self.n_order - 1, -1, -1):
             seq[k] = init_idx % self.num_symbols
             init_idx //= self.num_symbols
+            true_probs_seq[k] = 1.0 / self.num_symbols # 初始位給均勻分佈
         
-        # Rollout
         for t in range(self.n_order, self.seq_len + 1):
             idx = get_index_from_history(seq[t-self.n_order:t], self.powers)
+            # 關鍵：存下當前的轉移機率向量
+            true_probs_seq[t] = self.P[idx] 
             seq[t] = torch.multinomial(self.P[idx], 1).item()
-        return seq
+            
+        return seq, true_probs_seq # 回傳兩個東西
+
 
 # ==========================================
 # 2. ICLMarkovChainDataset (Edelman et al. 動態設定)
 # ==========================================
 # ICL-MC dataset from Edelman et al. 
+
 class ICLMarkovChainDataset(SequenceDataset):
     def generate_sequence(self) -> torch.Tensor:
         num_states = self.num_symbols ** self.n_order
-        # 每次生成都重新抽樣 P
-        P = self.dirichlet.sample((num_states,))
+        P = self.dirichlet.sample((num_states,)) # 每次動態抽樣 P
         stationary_prob = get_stationary_distribution(P, self.n_order, self.num_symbols)
         
         seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
+        # 建立一個儲存「真理」的張量
+        true_probs_seq = torch.zeros(self.seq_len + 1, self.num_symbols)
+        
         init_idx = torch.multinomial(stationary_prob, 1).item()
         for k in range(self.n_order - 1, -1, -1):
             seq[k] = init_idx % self.num_symbols
             init_idx //= self.num_symbols
+            # 前面幾位是初始，給個均勻分佈或 0 即可
+            true_probs_seq[k] = 1.0 / self.num_symbols 
 
         for t in range(self.n_order, self.seq_len + 1):
             idx = get_index_from_history(seq[t-self.n_order:t], self.powers)
+            # 關鍵：把這一點的真實 P[idx] 存起來
+            true_probs_seq[t] = P[idx] 
             seq[t] = torch.multinomial(P[idx], 1).item()
-        return seq
+            
+        return seq, true_probs_seq
 
 # ==========================================
 # 3. HMMDataset (隱藏狀態與觀測值)
@@ -114,40 +132,34 @@ class HMMDataset(SequenceDataset):
         self.stationary_hidden = get_stationary_distribution(self.A, self.n_order, self.num_hidden)
 
     # HMMDataset 內部的 generate_sequence 邏輯
-    def generate_sequence(self):
-        z_seq = [] # 隱藏狀態
-        s_seq = [] # 觀測值
-        target_probs = [] # 理論最優分佈
+    def generate_sequence(self) -> tuple:
+        # 1. 先生成隱藏狀態序列 Z (這部分邏輯不變)
+        z_seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
+        init_idx = torch.multinomial(self.stationary_hidden, 1).item()
+        for k in range(self.n_order - 1, -1, -1):
+            z_seq[k] = init_idx % self.num_hidden
+            init_idx //= self.num_hidden
 
-        # 1. 抽樣第一個隱藏狀態 z1
-        curr_z = torch.multinomial(self.stationary_hidden, 1).item()
-    
-        for t in range(self.seq_len):
-            z_seq.append(curr_z)
+        for t in range(self.n_order, self.seq_len + 1):
+            idx = get_index_from_history(z_seq[t-self.n_order:t], self.hidden_powers)
+            z_seq[t] = torch.multinomial(self.A[idx], 1).item()
         
-            # 當前 z_t 對應的發射機率分佈，這就是 Transformer 應該要猜中的答案
-            # 注意：這是對應「即將生成的 s_t」的分佈
-            target_probs.append(self.B[curr_z]) 
+        # 2. 根據隱藏序列 Z，透過發射矩陣 B 生成觀測序列 X
+        x_seq = torch.zeros(self.seq_len + 1, dtype=torch.long)
         
-            # 2. 根據 curr_z 生成觀測值 s_t
-            curr_s = torch.multinomial(self.B[curr_z], 1).item()
-            s_seq.append(curr_s)
+        # 新增：建立儲存「真理」的張量，形狀為 [序列長度, 觀測值種類數]
+        # 這代表：如果在 Z[t] 這個狀態，產生各個 X 的真實機率是多少
+        true_probs_seq = torch.zeros(self.seq_len + 1, self.num_obs)
         
-            # 3. 轉移到下一個隱藏狀態 z_{t+1}
-            curr_z = torch.multinomial(self.A[curr_z], 1).item()
-
-        # 回傳時，target_probs 的 shape 會是 [seq_len, vocab_size]
-        return torch.tensor(s_seq), torch.stack(target_probs)
-
-    def __getitem__(self, idx):
-        s_seq, target_probs = self.generate_sequence()
-        x = s_seq[:-1] # 輸入
-        y = s_seq[1:]  # 標籤
-        # 我們要預測的是 y，所以 target_probs 也要對齊 y 的時間點
-        target_dist = target_probs[1:] 
-    
-        return x, y, target_dist 
-      
+        for t in range(self.seq_len + 1):
+            current_z = z_seq[t]
+            # 關鍵點：這就是該時刻的真實機率分佈
+            true_probs_seq[t] = self.B[current_z] 
+            x_seq[t] = torch.multinomial(self.B[current_z], 1).item()
+            
+        # 必須回傳 Tuple，否則 Parent 的 __getitem__ 會 unpacking 失敗
+        return x_seq, true_probs_seq
+          
 
 
 # ==========================================
