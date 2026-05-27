@@ -37,34 +37,34 @@ def compute_kl_divergence(logits, target_probs):
 # ==========================================
 # Trainer 類別 (對標論文 A.1 訓練邏輯)
 # ==========================================
-
 class Trainer:
-    def __init__(self, model, train_loader, test_loader, device, lr=3e-5):
+    def __init__(self, model, train_loader, test_loader, device, batch_size, lr=3e-5):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = device
-        
-        # 論文 A.1 指定使用 AdamW 與 weight_decay
+        self.batch_size = batch_size
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
         
-        # 儲存歷史數據
         self.history = {
-            "step_ce": [],   # 訓練中的雜訊數據
+            "examples_seen": [], # 橫軸：訓練過的總樣本數 (Examples)
+            "step_ce": [],
             "step_kl": [],
-            "test_ce": [],   # 穩定的評估數據 (Figure 3 來源)
+            "test_ce": [],
             "test_kl": [],
-            "test_at_step": [] 
+            "test_at_examples": []
         }
         self.total_steps = 0
+        self.examples_seen = 0 
 
     def train_epoch(self, epoch_idx, model_name):
         self.model.train()
-        total_loss = 0
-        pbar = tqdm(self.train_loader, desc=f"  {model_name} Epoch {epoch_idx}", leave=False)
+        pbar = tqdm(self.train_loader, desc=f"{model_name} Epoch {epoch_idx}", leave=False)
         
-        for x, y, p_true in pbar:
+        for x, y, p_true, info in pbar:
             x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
+            # Info 字典自動轉移裝置
+            info = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in info.items()}
             
             self.optimizer.zero_grad()
             logits, loss = self.model(x, y)
@@ -72,82 +72,71 @@ class Trainer:
             self.optimizer.step()
             
             self.total_steps += 1
+            self.examples_seen += x.size(0) # 累計處理過的樣本總數
             
-            # Step-level 記錄 (用於觀察微觀變化)
-            with torch.no_grad():
-                cur_ce = loss.item()
-                cur_kl = compute_kl_divergence(logits, p_true)
-                self.history["step_ce"].append(cur_ce)
-                self.history["step_kl"].append(cur_kl)
+            # 頻率監控 (每 20 個 step 記錄一次以提升效能)
+            if self.total_steps % 20 == 0:
+                with torch.no_grad():
+                    kl = self._compute_kl(logits, p_true)
+                    self.history["examples_seen"].append(self.examples_seen)
+                    self.history["step_ce"].append(loss.item())
+                    self.history["step_kl"].append(kl)
+                    pbar.set_postfix(Examples=self.examples_seen, CE=f"{loss.item():.4f}")
 
-            total_loss += cur_ce
-            pbar.set_postfix(CE=f"{cur_ce:.4f}", KL=f"{cur_kl:.4f}")
-            
-        return total_loss / len(self.train_loader)
+    def _compute_kl(self, logits, target_probs):
+        log_pred = F.log_softmax(logits, dim=-1)
+        return F.kl_div(log_pred, target_probs, reduction='batchmean').item()
 
     def evaluate(self):
         """在獨立的 Test Set 上進行評估"""
         self.model.eval()
         all_ce, all_kl = [], []
+        
         with torch.no_grad():
-            for x, y, p_true in self.test_loader:
+            for x, y, p_true, info in self.test_loader:
                 x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
                 logits, _ = self.model(x)
                 
-                all_ce.append(compute_cross_entropy(logits, y))
-                all_kl.append(compute_kl_divergence(logits, p_true))
+                # 計算 CE 與 KL
+                ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1).item()
+                kl = self._compute_kl(logits, p_true)
+                
+                all_ce.append(ce)
+                all_kl.append(kl)
         
         avg_ce = np.mean(all_ce)
         avg_kl = np.mean(all_kl)
         
         self.history["test_ce"].append(avg_ce)
         self.history["test_kl"].append(avg_kl)
-        self.history["test_at_step"].append(self.total_steps)
+        self.history["test_at_examples"].append(self.examples_seen)
         
+        # 🌟 關鍵：這裡必須有 return！
         return avg_ce, avg_kl
 
     def save_plots(self, title, filename):
-        """繪製對標論文 Figure 3 的圖表"""
-        fig, ax1 = plt.subplots(figsize=(10, 6))
-
-        steps = range(1, len(self.history["step_ce"]) + 1)
-        test_steps = self.history["test_at_step"]
-
-        # 1. Cross Entropy (藍色)
-        # 繪製淺色的原始數據 (訓練雜訊)
-        ax1.plot(steps, self.history["step_ce"], color='tab:blue', alpha=0.15, label='Train CE (Step)')
-        # 繪製深色的評估點 (平滑後的真實表現)
-        ax1.plot(test_steps, self.history["test_ce"], color='tab:blue', marker='o', markersize=4, linewidth=2, label='Test CE')
+        fig, ax1 = plt.subplots(figsize=(8, 5))
         
-        ax1.set_xlabel('Steps')
-        ax1.set_ylabel('Cross Entropy (nats)', color='tab:blue')
-        ax1.tick_params(axis='y', labelcolor='tab:blue')
-
-        # 2. KL Divergence (紅色)
+        # 繪圖
+        ax1.plot(self.history["examples_seen"], self.history["step_ce"], alpha=0.2, color='blue')
+        ax1.plot(self.history["test_at_examples"], self.history["test_ce"], marker='o', label='Test Loss (CE)', color='blue')
+        ax1.set_xlabel('Number of Examples')
+        ax1.set_ylabel('Cross Entropy')
+        
         ax2 = ax1.twinx()
-        ax2.plot(steps, self.history["step_kl"], color='tab:red', alpha=0.1, linestyle=':')
-        ax2.plot(test_steps, self.history["test_kl"], color='tab:red', marker='x', markersize=4, linestyle='--', linewidth=1.5, label='Test KL (P||Q)')
+        ax2.plot(self.history["examples_seen"], self.history["step_kl"], alpha=0.2, color='red')
+        ax2.plot(self.history["test_at_examples"], self.history["test_kl"], marker='x', label='Test KL (Oracle)', color='red')
+        ax2.set_ylabel('KL Divergence')
         
-        ax2.set_ylabel('KL Divergence', color='tab:red')
-        ax2.tick_params(axis='y', labelcolor='tab:red')
-
-        plt.title(f"Evolution of Induction: {title}")
-        fig.tight_layout()
-        plt.grid(True, which='both', alpha=0.3)
-        
-        # 建立聯合圖例
-        lines, labels = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc='upper right')
-
-        plt.savefig(f"{filename}.png", dpi=300)
+        plt.title(f"{title} - Learning Curve")
+        plt.savefig(f"{filename}.png")
         plt.close()
 
 # ==========================================
 # 修正後的實驗啟動流程 (ICL-Markov 對標)
 # ==========================================
 
-from dataset import ICLMarkovChainDataset, MarkovChainDataset, HMMDataset
+from dataset import ICLMarkovChainDataset, MarkovChainDataset, HMMDataset, ICLHMMDataset
 
 def run_experiment():
     summary_data = []
@@ -197,7 +186,7 @@ def run_experiment():
                 )
                 
                 # 3. 訓練與評估
-                trainer = Trainer(model, train_loader, test_loader, device, lr=config["lr"])
+                trainer = Trainer(model, train_loader, test_loader, device, batch_size=config["batch_size"], lr=config["lr"])
                 
                 epoch_pbar = tqdm(range(config["epochs"]), desc=f"  Training")
                 for epoch in epoch_pbar:
