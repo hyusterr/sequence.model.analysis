@@ -12,7 +12,8 @@ class TokenEmbedding(nn.Module):
         self.emb = nn.Embedding(vocab_size, d_model)
         self.d_model = d_model
     def forward(self, x):
-        return self.emb(x) * math.sqrt(self.d_model)
+        return self.emb(x) # * math.sqrt(self.d_model)
+    # Edelman et al did not times sqrt(d_model) in their implementation, and it seems to work well without it.
 
 class AbsolutePositionalEncoding(nn.Module):
     def __init__(self, d_model, block_size):
@@ -160,9 +161,31 @@ class Transformer(nn.Module):
                  pe_type='none', attn_type='standard', attention_only=False, use_residual=True):
         super().__init__()
         self.token_emb = TokenEmbedding(vocab_size, d_model)
+        # 強烈建議實驗時強制 pe_type='rpe'，不要用 absolute
         self.abs_pe = AbsolutePositionalEncoding(d_model, block_size) if pe_type == 'absolute' else nn.Identity()
+        
         self.blocks = nn.ModuleList([TransformerBlock(d_model, nhead, 4*d_model, block_size, pe_type, attn_type, attention_only, use_residual) for _ in range(num_layers)])
-        self.ln_f = nn.LayerNorm(d_model); self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # 🌟 3. 套用對標 GPT-2 的權重初始化
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                # 讓殘差分支初期的影響力極小化
+                torch.nn.init.normal_(p, mean=0.0, std=0.01)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
 
     def forward(self, idx, targets=None):
         x = self.abs_pe(self.token_emb(idx))
