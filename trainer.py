@@ -42,6 +42,7 @@ class Trainer:
             weight_decay=0.1,       # 🌟 加大權重衰減 (從 0.01 改 0.1)
             betas=(0.9, 0.95)       # 🌟 採用 GPT-2 標準動量
         )
+        # setting follows: https://github.com/EzraEdelman/Evolution-of-Statistical-Induction-Heads/blob/main/mingpt/trainer.py
         
         self.history = {
             "examples_seen": [], 
