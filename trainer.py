@@ -11,31 +11,15 @@ import torch.nn.functional as F
 from model import Transformer
 
 # ==========================================
-# 核心 Metrics 修正 (對標論文量級)
+# 核心 Metrics
 # ==========================================
 
 def compute_cross_entropy(logits, targets):
-    """計算平均每個 token 的 Cross Entropy"""
+    """計算平均每個 token 的 Cross Entropy (用於訓練)"""
     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1).item()
 
-def compute_kl_divergence(logits, target_probs):
-    """
-    計算模型預測與真實 P 之間的 KL Divergence。
-    確保輸出量級為平均每個 token 的 bits/nats。
-    """
-    # 轉為 log 空間
-    log_pred_probs = F.log_softmax(logits, dim=-1)
-    
-    # 使用 reduction='sum' 確保我們可以精確控制除數
-    # KL(P || Q) = sum(P * log(P/Q))
-    kl_sum = F.kl_div(log_pred_probs, target_probs, reduction='sum')
-    
-    batch_size, seq_len, _ = logits.size()
-    # 排除掉第一個無法預測的 token (對標論文實作)
-    return (kl_sum / (batch_size * seq_len)).item()
-
 # ==========================================
-# Trainer 類別 (對標論文 A.1 訓練邏輯)
+# Trainer 類別 (對標論文 test_last_token 邏輯)
 # ==========================================
 class Trainer:
     def __init__(self, model, train_loader, test_loader, device, batch_size, lr=3e-5):
@@ -48,10 +32,10 @@ class Trainer:
         
         self.history = {
             "examples_seen": [], # 橫軸：訓練過的總樣本數 (Examples)
-            "step_ce": [],
+            "step_ce": [],       # 訓練時的全序列平均 Loss
             "step_kl": [],
-            "test_ce": [],
-            "test_kl": [],
+            "test_ce": [],       # 測試時的 Last Token Loss
+            "test_kl": [],       # 測試時的 Last Token KL (Oracle)
             "test_at_examples": []
         }
         self.total_steps = 0
@@ -63,32 +47,29 @@ class Trainer:
         
         for x, y, p_true, info in pbar:
             x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
-            # Info 字典自動轉移裝置
             info = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in info.items()}
             
             self.optimizer.zero_grad()
-            logits, loss = self.model(x, y)
+            logits, loss = self.model(x, y) # 訓練時計算所有 Token 的 Loss
             loss.backward()
             self.optimizer.step()
             
             self.total_steps += 1
-            self.examples_seen += x.size(0) # 累計處理過的樣本總數
+            self.examples_seen += x.size(0) 
             
-            # 頻率監控 (每 20 個 step 記錄一次以提升效能)
             if self.total_steps % 20 == 0:
                 with torch.no_grad():
-                    kl = self._compute_kl(logits, p_true)
+                    # 訓練階段的監控，依然看全體的平均情況
+                    log_pred = F.log_softmax(logits, dim=-1)
+                    kl = F.kl_div(log_pred, p_true, reduction='batchmean').item()
+                    
                     self.history["examples_seen"].append(self.examples_seen)
                     self.history["step_ce"].append(loss.item())
                     self.history["step_kl"].append(kl)
                     pbar.set_postfix(Examples=self.examples_seen, CE=f"{loss.item():.4f}")
 
-    def _compute_kl(self, logits, target_probs):
-        log_pred = F.log_softmax(logits, dim=-1)
-        return F.kl_div(log_pred, target_probs, reduction='batchmean').item()
-
     def evaluate(self):
-        """在獨立的 Test Set 上進行評估"""
+        """對標 test_error.test_last_token 在獨立 Test Set 上進行評估"""
         self.model.eval()
         all_ce, all_kl = [], []
         
@@ -97,9 +78,18 @@ class Trainer:
                 x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
                 logits, _ = self.model(x)
                 
-                # 計算 CE 與 KL
-                ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1).item()
-                kl = self._compute_kl(logits, p_true)
+                # 🌟 關鍵修改：只取最後一個 Token 進行評估！
+                # logits 原本是 [Batch, Seq_len, Vocab] -> 變成 [Batch, Vocab]
+                last_logits = logits[:, -1, :] 
+                last_y = y[:, -1]
+                last_p_true = p_true[:, -1, :]
+                
+                # 1. 計算 Last Token Cross Entropy
+                ce = F.cross_entropy(last_logits, last_y).item()
+                
+                # 2. 計算 Last Token KL Divergence (與 Oracle 比較)
+                log_pred = F.log_softmax(last_logits, dim=-1)
+                kl = F.kl_div(log_pred, last_p_true, reduction='batchmean').item()
                 
                 all_ce.append(ce)
                 all_kl.append(kl)
@@ -111,31 +101,35 @@ class Trainer:
         self.history["test_kl"].append(avg_kl)
         self.history["test_at_examples"].append(self.examples_seen)
         
-        # 🌟 關鍵：這裡必須有 return！
         return avg_ce, avg_kl
 
     def save_plots(self, title, filename):
         fig, ax1 = plt.subplots(figsize=(8, 5))
         
-        # 繪圖
-        ax1.plot(self.history["examples_seen"], self.history["step_ce"], alpha=0.2, color='blue')
-        ax1.plot(self.history["test_at_examples"], self.history["test_ce"], marker='o', label='Test Loss (CE)', color='blue')
+        ax1.plot(self.history["examples_seen"], self.history["step_ce"], alpha=0.15, color='blue', label='Train CE (All Tokens)')
+        ax1.plot(self.history["test_at_examples"], self.history["test_ce"], marker='o', label='Test CE (Last Token)', color='blue', linewidth=2)
         ax1.set_xlabel('Number of Examples')
-        ax1.set_ylabel('Cross Entropy')
+        ax1.set_ylabel('Cross Entropy (nats)')
         
         ax2 = ax1.twinx()
-        ax2.plot(self.history["examples_seen"], self.history["step_kl"], alpha=0.2, color='red')
-        ax2.plot(self.history["test_at_examples"], self.history["test_kl"], marker='x', label='Test KL (Oracle)', color='red')
+        ax2.plot(self.history["examples_seen"], self.history["step_kl"], alpha=0.1, color='red', linestyle=':')
+        ax2.plot(self.history["test_at_examples"], self.history["test_kl"], marker='x', label='Test KL (Last Token Oracle)', color='red', linewidth=1.5)
         ax2.set_ylabel('KL Divergence')
         
-        plt.title(f"{title} - Learning Curve")
-        plt.savefig(f"{filename}.png")
+        plt.title(f"Evolution of Induction: {title}")
+        fig.tight_layout()
+        
+        # 讓圖例統整顯示
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc='upper right')
+        
+        plt.savefig(f"{filename}.png", dpi=300)
         plt.close()
 
 # ==========================================
-# 修正後的實驗啟動流程 (ICL-Markov 對標)
+# 修正後的實驗啟動流程
 # ==========================================
-
 from dataset import ICLMarkovChainDataset, MarkovChainDataset, HMMDataset, ICLHMMDataset
 
 def run_experiment():
@@ -143,19 +137,17 @@ def run_experiment():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists("results"): os.makedirs("results")
     
-    # 論文 A.1 的標準配置
     config = {
         "seq_len": 100, 
         "num_symbols": 3, 
         "n_order": 1,
-        "embed_dim": 16, # 關鍵：d=16
+        "embed_dim": 16, 
         "num_heads": 2, 
         "epochs": 20,
-        "batch_size": 64, # 對標論文
-        "lr": 3e-5 # 對標一階馬可夫
+        "batch_size": 64,
+        "lr": 3e-5
     }
 
-    # 目前專注於最能觀察相變的 ICL-Markov
     dataset_names = ["ICL-Markov"] 
     layer_options = [2, 1] 
     attn_types = ["attention-only", "standard", "linear"]
@@ -166,36 +158,31 @@ def run_experiment():
                 model_tag = f"{data_name}_L{n_layer}_{attn}"
                 print(f"\n>>> Running: {model_tag}")
 
-                # 1. 數據集準備 (確保 Train/Test 分離)
                 train_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"], virtual_size=12800)
                 test_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"], virtual_size=256)
                 
                 train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
                 test_loader = DataLoader(test_ds, batch_size=64)
 
-                # 2. 模型初始化
                 model = Transformer(
                     vocab_size=config["num_symbols"],
                     d_model=config["embed_dim"],
                     nhead=config["num_heads"],
                     num_layers=n_layer,
                     block_size=config["seq_len"],
-                    pe_type='absolute', 
+                    # pe_type='absolute',  # edelman et al use RPE
                     attn_type=("standard" if attn == "attention-only" else attn),
                     attention_only=(attn == "attention-only")
                 )
                 
-                # 3. 訓練與評估
                 trainer = Trainer(model, train_loader, test_loader, device, batch_size=config["batch_size"], lr=config["lr"])
                 
                 epoch_pbar = tqdm(range(config["epochs"]), desc=f"  Training")
                 for epoch in epoch_pbar:
                     trainer.train_epoch(epoch + 1, model_tag)
-                    # 每完成一個 Epoch 就跑一次完整的 Test Evaluation
                     ce, kl = trainer.evaluate()
                     epoch_pbar.set_postfix(Test_CE=f"{ce:.3f}", Test_KL=f"{kl:.4f}")
                 
-                # 4. 存圖與數據
                 trainer.save_plots(model_tag, f"results/{model_tag}")
                 
                 summary_data.append({
