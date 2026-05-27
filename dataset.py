@@ -55,6 +55,9 @@ class SequenceDataset(Dataset):
 # 1. MarkovChainDataset (固定設定)
 # ==========================================
 class MarkovChainDataset(SequenceDataset):
+    '''
+    固定設定的馬可夫鏈資料集，P 在初始化時抽樣一次，整個資料集使用同一個 P。
+    '''
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         num_states = self.num_symbols ** self.n_order
@@ -64,6 +67,7 @@ class MarkovChainDataset(SequenceDataset):
 
     def __getitems__(self, indices):
         B = len(indices)
+        info_list = [{}] * B
         
         seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
         true_probs_seq = torch.zeros((B, self.seq_len + 1, self.num_symbols))
@@ -82,7 +86,7 @@ class MarkovChainDataset(SequenceDataset):
             true_probs_seq[:, t] = current_probs 
             seq[:, t] = torch.multinomial(current_probs, 1).squeeze(-1)
             
-        return list(zip(seq[:, :-1], seq[:, 1:], true_probs_seq[:, :-1]))
+        return list(zip(seq[:, :-1], seq[:, 1:], true_probs_seq[:, :-1], info_list))
 
 
 # ==========================================
@@ -91,6 +95,7 @@ class MarkovChainDataset(SequenceDataset):
 class ICLMarkovChainDataset(SequenceDataset):
     def __getitems__(self, indices):
         B = len(indices)
+        info_list = [{}] * B
         num_states = self.num_symbols ** self.n_order
         
         # 批次動態抽樣 P
@@ -113,7 +118,7 @@ class ICLMarkovChainDataset(SequenceDataset):
             true_probs_seq[:, t] = current_probs 
             seq[:, t] = torch.multinomial(current_probs, 1).squeeze(-1)
             
-        return list(zip(seq[:, :-1], seq[:, 1:], true_probs_seq[:, :-1]))
+        return list(zip(seq[:, :-1], seq[:, 1:], true_probs_seq[:, :-1], info_list))
 
 
 # ==========================================
@@ -134,25 +139,59 @@ class HMMDataset(SequenceDataset):
 
     def __getitems__(self, indices):
         B = len(indices)
+        
+        # 用來記錄真實走過的隱藏路徑
         z_seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
         
+        # 🌟 1. 新增：用來記錄上帝視角的 Next Token Probability 分佈
+        oracle_probs_seq = torch.zeros((B, self.seq_len + 1, self.num_obs))
+        
+        # 初始狀態抽樣
         init_idx = torch.multinomial(self.stationary_hidden.expand(B, -1), 1).squeeze(-1)
         for k in range(self.n_order - 1, -1, -1):
             z_seq[:, k] = init_idx % self.num_hidden
             init_idx //= self.num_hidden
+            
+            # 初始階段的 Oracle 機率：平穩分佈 [B, num_hidden] 乘上 發射矩陣 [num_hidden, num_obs]
+            oracle_probs_seq[:, k] = torch.matmul(self.stationary_hidden.expand(B, -1), self.B)
 
+        # 遞迴生成 Z 序列與記錄 Oracle 機率
         for t in range(self.n_order, self.seq_len + 1):
             idx = (z_seq[:, t-self.n_order:t] * self.hidden_powers).sum(dim=1)
-            z_seq[:, t] = torch.multinomial(self.A[idx], 1).squeeze(-1)
+            
+            current_trans_probs = self.A[idx] # Shape: [B, num_hidden]
+            
+            # 🌟 2. 核心：計算 P(X_t | Z_{<t}) = Trans @ Emission
+            # [B, num_hidden] @ [num_hidden, num_obs] -> [B, num_obs]
+            oracle_probs_seq[:, t] = torch.matmul(current_trans_probs, self.B)
+            
+            # 決定下一步真正走到的隱藏狀態 Z_t
+            z_seq[:, t] = torch.multinomial(current_trans_probs, 1).squeeze(-1)
         
-        # 跨時間維度超級向量化生成 X
-        true_probs_seq = self.B[z_seq] # [B, seq_len+1, num_obs]
-        
-        flat_probs = true_probs_seq.view(-1, self.num_obs)
+        # 3. 根據真正發生的 Z_t，生成真實的觀測值 X_t (這部分維持不變，因為物理現實是從確定的 Z 發射 X)
+        emission_probs_seq = self.B[z_seq] # 這是 P(X_t | Z_t)
+        flat_probs = emission_probs_seq.view(-1, self.num_obs)
         flat_x = torch.multinomial(flat_probs, 1).squeeze(-1)
         x_seq = flat_x.view(B, self.seq_len + 1)
         
-        return list(zip(x_seq[:, :-1], x_seq[:, 1:], true_probs_seq[:, :-1]))
+        # 4. 對齊與回傳
+        x = x_seq[:, :-1]  # 模型輸入
+        y = x_seq[:, 1:]   # 模型預測目標 (Target)
+        
+        # 🌟 5. 修正對齊：預測 y 的機率，就是時間點 1 到結尾的 Oracle 機率
+        p_true = oracle_probs_seq[:, 1:] 
+        
+        # 你依然可以把原先確定的 Emission 或 Z 路徑封裝進字典，用於 Attention / Probing 分析
+        info_list = [
+            {
+                "z_states": z,                      # Shape: [seq_len]
+                "realized_emission_probs": em       # Shape: [seq_len, num_obs]
+            } 
+            for z, em in zip(z_seq[:, :-1], emission_probs_seq[:, :-1])
+        ]
+        
+        return list(zip(x, y, p_true, info_list))
+
 
 
 # ==========================================
@@ -160,6 +199,7 @@ class HMMDataset(SequenceDataset):
 # ==========================================
 class ICLHMMDataset(SequenceDataset):
     def __init__(self, seq_len, num_hidden, num_obs, n_order=1, virtual_size=10000):
+        # 注意：這裡 num_symbols 在 Dataset 內傳遞的是觀測值空間 num_obs
         super().__init__(seq_len, num_obs, n_order, virtual_size)
         self.num_hidden = num_hidden
         self.hidden_powers = self.num_hidden ** torch.arange(n_order - 1, -1, -1)
@@ -167,29 +207,60 @@ class ICLHMMDataset(SequenceDataset):
     def __getitems__(self, indices):
         B = len(indices)
         
+        # 1. 動態抽樣該 Batch 的參數
         A = dist.Dirichlet(torch.ones(self.num_hidden)).sample((B, self.num_hidden**self.n_order))
         B_mat = dist.Dirichlet(torch.ones(self.num_symbols)).sample((B, self.num_hidden))
         stat_h = batched_stationary_distribution(A, self.n_order, self.num_hidden)
         
         z_seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
-        init_idx = torch.multinomial(stat_h, 1).squeeze(-1)
         
+        # 🌟 新增：Oracle 預測分佈張量 [B, seq_len+1, num_symbols]
+        oracle_probs_seq = torch.zeros((B, self.seq_len + 1, self.num_symbols))
+        
+        # 初始狀態生成
+        init_idx = torch.multinomial(stat_h, 1).squeeze(-1)
         for k in range(self.n_order - 1, -1, -1):
             z_seq[:, k] = init_idx % self.num_hidden
             init_idx //= self.num_hidden
             
+            # Oracle 初始分佈：stationary @ Emission
+            # B_mat 形狀 [B, num_hidden, num_symbols]
+            oracle_probs_seq[:, k] = torch.matmul(stat_h, B_mat)
+
         batch_idx = torch.arange(B)
+        
+        # 遞迴生成 Z 序列與 Oracle 預測
         for t in range(self.n_order, self.seq_len + 1):
             idx = (z_seq[:, t-self.n_order:t] * self.hidden_powers).sum(dim=1)
-            z_seq[:, t] = torch.multinomial(A[batch_idx, idx], 1).squeeze(-1)
+            current_A = A[batch_idx, idx] # [B, num_hidden]
             
+            # 🌟 Oracle 核心：P(X_t | Z_{<t}) = A @ B
+            oracle_probs_seq[:, t] = torch.matmul(current_A, B_mat)
+            
+            # 實際路徑採樣
+            z_seq[:, t] = torch.multinomial(current_A, 1).squeeze(-1)
+            
+        # 生成實際觀測序列 X
         true_probs_seq = B_mat[batch_idx.unsqueeze(1), z_seq] 
         flat_probs = true_probs_seq.view(-1, self.num_symbols)
         flat_x = torch.multinomial(flat_probs, 1).squeeze(-1)
         x_seq = flat_x.view(B, self.seq_len + 1)
         
-        return list(zip(x_seq[:, :-1], x_seq[:, 1:], true_probs_seq[:, :-1]))
-
+        # 2. 封裝資訊
+        # p_true 設為 oracle_probs_seq[:, 1:] 以對齊預測目標 y
+        p_true = oracle_probs_seq[:, 1:]
+        
+        info_list = [
+            {
+                "z_states": z,
+                "A_matrix": a,
+                "B_matrix": b,
+                "realized_emission_probs": em
+            }
+            for z, a, b, em in zip(z_seq[:, :-1], A, B_mat, true_probs_seq[:, :-1])
+        ]
+        
+        return list(zip(x_seq[:, :-1], x_seq[:, 1:], p_true, info_list))
 
 # ==========================================
 # 5. GINCDataset (Xie et al. 2022)
