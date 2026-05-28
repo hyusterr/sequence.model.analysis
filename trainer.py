@@ -77,12 +77,12 @@ class Trainer:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.lr * 0.1 + self.lr * 0.9 * coeff
 
-    def train_epoch(self, epoch_idx, model_name):
+    def train_epoch(self, epoch_idx, model_name, fixed_test_data, eval_interval=20):
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"{model_name} Epoch {epoch_idx}", leave=False)
         
         for x, y, p_true, info in pbar:
-            # 1. 更新當前 Step 的學習率
+            # 1. 學習率更新
             lr = self._get_lr()
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
@@ -93,20 +93,33 @@ class Trainer:
             logits, loss = self.model(x, y)
             loss.backward()
             
-            # 🌟 黑魔法 4：保護脆弱的歸納頭不被梯度炸毀
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # (注意：這裡已經依照先前的結論，拿掉 clip_grad_norm_ 以釋放相變動能)
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
             self.total_steps += 1
             self.examples_seen += x.size(0)
             
-            if self.total_steps % 20 == 0:
+            # ==========================================
+            # 🌟 高頻率評估：每 eval_interval 步，執行一次 Test
+            # ==========================================
+            if self.total_steps % eval_interval == 0:
                 with torch.no_grad():
-                    kl = compute_kl_divergence(logits, p_true)
+                    # 紀錄訓練集 Loss
+                    train_kl = compute_kl_divergence(logits, p_true)
                     self.history["examples_seen"].append(self.examples_seen)
                     self.history["step_ce"].append(loss.item())
-                    self.history["step_kl"].append(kl)
-                    pbar.set_postfix(Examples=self.examples_seen, CE=f"{loss.item():.4f}", LR=f"{lr:.1e}")
+                    self.history["step_kl"].append(train_kl)
+                    
+                # 評估測試集並紀錄
+                test_ce, test_kl = self.evaluate(fixed_test_data)
+                
+                # ⚠️ 關鍵：evaluate 裡面呼叫了 self.model.eval()，這裡必須切回 train 模式
+                self.model.train()
+                
+                pbar.set_postfix(Test_CE=f"{test_ce:.3f}", Test_KL=f"{test_kl:.4f}")
+
+
 
     def evaluate(self, fixed_test_data):
         """傳入預先生成好的 Test Data，消除動態抽樣帶來的評估震盪"""
@@ -163,77 +176,113 @@ class Trainer:
         plt.savefig(f"{filename}.png", dpi=300)
         plt.close()
 
-# ==========================================
-# 實驗啟動流程
-# ==========================================
+import itertools
+
 def run_experiment():
     summary_data = []
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists("results"): os.makedirs("results")
     
-    config = {
-        "seq_len": 100, 
-        "num_symbols": 3, 
-        "n_order": 1,
-        "embed_dim": 16,
-        "num_heads": 1,   # 🌟 黑魔法 5：測 Bigram 時強制單頭注意力
-        "epochs": 20,
-        "batch_size": 64, 
-        "lr": 5e-4        # 維持充足的動能
+    # ==========================================
+    # 🌟 擴充版超參數矩陣 (加入了 lr 進行網格搜尋)
+    # ==========================================
+    grid = {
+        "data_name": ["ICL-Markov"],
+        "num_symbols": [3, 2],        
+        "n_order": [1, 2],            
+        "n_layer": [2, 1],         
+        "attn": ["attention-only", "standard", "linear"], 
+        "embed_dim": [16],         
+        "num_heads": [1, 2],          
+        "lr": [3e-5, 1e-4, 5e-4]   # 🌟 將 LR 放進來跑排列組合
+    }
+    
+    # 固定訓練參數 (移除 lr)
+    train_params = {
+        "seq_len": 100,
+        "epochs": 30,
+        "batch_size": 64,
+        "eval_interval": 20       
     }
 
-    dataset_names = ["ICL-Markov"] 
-    layer_options = [2, 1] 
-    attn_types = ["attention-only", "standard", "linear"]
+    # 自動展開所有的排列組合
+    keys, values = zip(*grid.items())
+    experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    # 溫馨提醒：排列組合數量會相乘，例如 2(layer) x 3(attn) x 3(lr) = 18 組實驗
+    print(f"總共準備執行 {len(experiments)} 組實驗...\n")
 
-    print(">>> 預先生成並固定測試集 (消滅抽樣震盪)...")
-    test_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"], virtual_size=4000)
-    test_loader = DataLoader(test_ds, batch_size=200, shuffle=False)
-    fixed_test_data = []
-    for x, y, p_true, info in test_loader:
-        fixed_test_data.append((x.clone(), y.clone(), p_true.clone()))
+    for p in experiments:
+        # 1. 🌟 檔名加入 LR，避免不同學習率的圖互相覆蓋
+        dataset_str = f"{p['data_name']}_V{p['num_symbols']}_O{p['n_order']}"
+        model_str = f"L{p['n_layer']}_H{p['num_heads']}_D{p['embed_dim']}_{p['attn']}_LR{p['lr']}" 
+        model_tag = f"{dataset_str}_{model_str}"
+        
+        print(f"\n>>> Running: {model_tag}")
 
-    for data_name in dataset_names:
-        for n_layer in layer_options:
-            for attn in attn_types:
-                model_tag = f"{data_name}_L{n_layer}_{attn}"
-                print(f"\n>>> 啟動訓練: {model_tag}")
+        # 2. 生成對應參數的 Dataset
+        test_ds = ICLMarkovChainDataset(train_params["seq_len"], p["num_symbols"], p["n_order"], virtual_size=4000)
+        test_loader = DataLoader(test_ds, batch_size=200, shuffle=False)
+        
+        print("    Pre-generating fixed Test Set...")
+        fixed_test_data = []
+        for x, y, p_true, info in test_loader:
+            fixed_test_data.append((x.clone(), y.clone(), p_true.clone()))
 
-                train_ds = ICLMarkovChainDataset(config["seq_len"], config["num_symbols"], config["n_order"], virtual_size=12800)
-                train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
+        train_ds = ICLMarkovChainDataset(train_params["seq_len"], p["num_symbols"], p["n_order"], virtual_size=12800)
+        train_loader = DataLoader(train_ds, batch_size=train_params["batch_size"], shuffle=True)
 
-                model = Transformer(
-                    vocab_size=config["num_symbols"],
-                    d_model=config["embed_dim"],
-                    nhead=config["num_heads"],
-                    num_layers=n_layer,
-                    block_size=config["seq_len"],
-                    pe_type='rpe', 
-                    attn_type=("standard" if attn == "attention-only" else attn),
-                    attention_only=(attn == "attention-only")
-                )
-                
-                # 初始化裝備了 minGPT 引擎的 Trainer
-                trainer = Trainer(model, train_loader, device, config)
-                
-                epoch_pbar = tqdm(range(config["epochs"]), desc="  Epoch Progress")
-                for epoch in epoch_pbar:
-                    trainer.train_epoch(epoch + 1, model_tag)
-                    ce, kl = trainer.evaluate(fixed_test_data)
-                    # 顯示當前最終的 LR (抓取優化器中實際的數值)
-                    current_lr = trainer.optimizer.param_groups[0]['lr']
-                    epoch_pbar.set_postfix(Test_CE=f"{ce:.3f}", Test_KL=f"{kl:.4f}", LR=f"{current_lr:.1e}")
-                
-                trainer.save_plots(model_tag, f"results/{model_tag}")
-                
-                summary_data.append({
-                    "Model": model_tag,
-                    "Final_CE": f"{ce:.6f}",
-                    "Final_KL": f"{kl:.6f}"
-                })
+        # 3. 初始化 Model
+        model = Transformer(
+            vocab_size=p["num_symbols"],
+            d_model=p["embed_dim"],
+            nhead=p["num_heads"],
+            num_layers=p["n_layer"],
+            block_size=train_params["seq_len"],
+            pe_type='rpe',
+            attn_type=("standard" if p["attn"] == "attention-only" else p["attn"]),
+            attention_only=(p["attn"] == "attention-only")
+        )
+        
+        # 4. 初始化 Trainer (🌟 動態讀取 p["lr"])
+        config_for_trainer = {
+            "lr": p["lr"], 
+            "epochs": train_params["epochs"]
+        }
+        trainer = Trainer(model, train_loader, device, config_for_trainer)
+        
+        # 5. 訓練流程
+        epoch_pbar = tqdm(range(train_params["epochs"]), desc="    Epochs")
+        for epoch in epoch_pbar:
+            trainer.train_epoch(epoch + 1, model_tag, fixed_test_data, eval_interval=train_params["eval_interval"])
+            if len(trainer.history["test_kl"]) > 0:
+                epoch_pbar.set_postfix(Test_KL=f"{trainer.history['test_kl'][-1]:.4f}")
+        
+        # 6. 存圖與寫入記錄
+        trainer.save_plots(model_tag, f"results/{model_tag}")
+        
+        final_ce = trainer.history["test_ce"][-1] if trainer.history["test_ce"] else 0.0
+        final_kl = trainer.history["test_kl"][-1] if trainer.history["test_kl"] else 0.0
 
-    pd.DataFrame(summary_data).to_csv("results/summary.csv", index=False)
-    print("\n[Finished] 訓練完成，請查看 'results' 資料夾中的圖片。")
+        summary_data.append({
+            "Dataset_Setting": dataset_str,
+            "Model_Setting": model_str,
+            "Data_Name": p["data_name"],
+            "Num_Symbols": p["num_symbols"],
+            "N_Order": p["n_order"],
+            "Model_Type": p["attn"],
+            "Layers": p["n_layer"],
+            "Heads": p["num_heads"],
+            "Embed_Dim": p["embed_dim"],
+            "LR": p["lr"],               # 🌟 新增 LR 欄位到 CSV
+            "Final_CE": f"{final_ce:.6f}",
+            "Final_KL": f"{final_kl:.6f}"
+        })
+
+        # 即時存檔
+        pd.DataFrame(summary_data).to_csv("results/summary.csv", index=False)
+
+    print("\n[Finished] 所有實驗執行完畢！")
 
 if __name__ == "__main__":
     run_experiment()
