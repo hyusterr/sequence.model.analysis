@@ -3,3 +3,14 @@ ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,
 ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR0.0001,ICL-Markov,3,1,attention-only,2,1,16,0.0001,0.972139,0.205645
 ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR0.0005,ICL-Markov,3,1,attention-only,2,1,16,0.0005,0.861983,0.340137
 ICL-Markov_V3_O1,L2_H2_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,2,2,16,3e-05,0.978642,0.194249
+ICL-Markov_V3_O1,L2_H2_D16_attention-only_LR0.0001,ICL-Markov,3,1,attention-only,2,2,16,0.0001,0.981672,0.196357
+ICL-Markov_V3_O1,L2_H2_D16_attention-only_LR0.0005,ICL-Markov,3,1,attention-only,2,2,16,0.0005,0.848113,0.323386
+ICL-Markov_V3_O1,L2_H1_D16_standard_LR3e-05,ICL-Markov,3,1,standard,2,1,16,3e-05,0.984893,0.192657
+ICL-Markov_V3_O1,L2_H1_D16_standard_LR0.0001,ICL-Markov,3,1,standard,2,1,16,0.0001,0.917360,0.220172
+ICL-Markov_V3_O1,L2_H1_D16_standard_LR0.0005,ICL-Markov,3,1,standard,2,1,16,0.0005,0.855497,0.318398
+ICL-Markov_V3_O1,L2_H2_D16_standard_LR3e-05,ICL-Markov,3,1,standard,2,2,16,3e-05,0.991439,0.194571
+ICL-Markov_V3_O1,L2_H2_D16_standard_LR0.0001,ICL-Markov,3,1,standard,2,2,16,0.0001,0.927095,0.210718
+ICL-Markov_V3_O1,L2_H2_D16_standard_LR0.0005,ICL-Markov,3,1,standard,2,2,16,0.0005,0.857576,0.322505
+ICL-Markov_V3_O1,L2_H1_D16_linear_LR3e-05,ICL-Markov,3,1,linear,2,1,16,3e-05,0.994031,0.195230
+ICL-Markov_V3_O1,L2_H1_D16_linear_LR0.0001,ICL-Markov,3,1,linear,2,1,16,0.0001,0.976333,0.197344
+ICL-Markov_V3_O1,L2_H1_D16_linear_LR0.0005,ICL-Markov,3,1,linear,2,1,16,0.0005,0.967070,0.194386
