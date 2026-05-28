@@ -1,7 +1,7 @@
 Model,Final_CE,Final_KL
-ICL-Markov_L2_attention-only,0.982755,0.190055
-ICL-Markov_L2_standard,0.975782,0.193994
-ICL-Markov_L2_linear,0.961276,0.188910
-ICL-Markov_L1_attention-only,0.976782,0.195551
-ICL-Markov_L1_standard,0.989191,0.191279
-ICL-Markov_L1_linear,0.971158,0.192687
+ICL-Markov_L2_attention-only,0.875234,0.348199
+ICL-Markov_L2_standard,0.825529,0.361499
+ICL-Markov_L2_linear,0.968028,0.200041
+ICL-Markov_L1_attention-only,0.994732,0.177825
+ICL-Markov_L1_standard,0.966262,0.180151
+ICL-Markov_L1_linear,0.967853,0.193648
