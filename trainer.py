@@ -173,9 +173,9 @@ def run_experiment():
         "n_order": 1,
         "embed_dim": 16,
         "num_heads": 2, 
-        "epochs": 20,
+        "epochs": 40,
         "batch_size": 64, 
-        "lr": 3e-5
+        "lr": 5e-4
     }
 
     dataset_names = ["ICL-Markov"] 
