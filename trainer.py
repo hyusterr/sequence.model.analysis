@@ -66,6 +66,7 @@ class Trainer:
             self.optimizer.zero_grad()
             logits, loss = self.model(x, y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
             self.total_steps += 1
@@ -174,7 +175,7 @@ def run_experiment():
         "num_heads": 2, 
         "epochs": 20,
         "batch_size": 64, 
-        "lr": 5e-4
+        "lr": 3e-5
     }
 
     dataset_names = ["ICL-Markov"] 

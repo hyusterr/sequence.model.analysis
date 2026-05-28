@@ -92,7 +92,7 @@ class MultiHeadAttention(nn.Module):
         if self.attn_type == 'standard':
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             if self.pe_type == 'rpe':
-                rpe_bias = torch.einsum("ijhe,bhei->bhij", self.wpe_rel(self.pos_matrix[:T, :T]).view(T, T, self.nhead, self.head_dim), q)
+                rpe_bias = torch.einsum("ijhe,bhie->bhij", self.wpe_rel(self.pos_matrix[:T, :T]).view(T, T, self.nhead, self.head_dim), q)
                 att += rpe_bias * (1.0 / math.sqrt(self.head_dim))
             att = F.softmax(att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')), dim=-1)
             y = self.attn_dropout(att) @ v
