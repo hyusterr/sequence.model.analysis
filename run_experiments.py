@@ -1,6 +1,6 @@
 import os
 import itertools
-import argparse  # 🌟 新增：用於解析命令行參數
+import argparse  # 用於解析命令行參數
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
@@ -41,7 +41,7 @@ def run_experiment():
         "attn": ["attention-only", "standard", "linear"], 
         "embed_dim": [16],         
         "num_heads": [1, 2],          
-        "lr": args.lr   # 🌟 重點：這張卡只跑外面傳進來的特定 LR
+        "lr": args.lr   # 這張卡只跑外面傳進來的特定 LR
     }
     
     train_params = {
@@ -92,22 +92,25 @@ def run_experiment():
         config_for_trainer = {
             "lr": p["lr"], 
             "epochs": train_params["epochs"],
-            "batch_size": train_params["batch_size"] # 🌟 給對標畫圖換算使用的 config
+            "batch_size": train_params["batch_size"]
         }
         trainer = Trainer(model, train_loader, device, config_for_trainer)
         
-        # 訓練流程
+        # 🌟 5. 訓練流程 (已修正為新指標 test_theory_kl)
         epoch_pbar = tqdm(range(train_params["epochs"]), desc="    Epochs")
         for epoch in epoch_pbar:
             trainer.train_epoch(epoch + 1, model_tag, fixed_test_data, eval_interval=train_params["eval_interval"])
-            if len(trainer.history["test_kl"]) > 0:
-                epoch_pbar.set_postfix(Test_KL=f"{trainer.history['test_kl'][-1]:.4f}")
+            if len(trainer.history["test_theory_kl"]) > 0:
+                epoch_pbar.set_postfix(Theory_KL=f"{trainer.history['test_theory_kl'][-1]:.4f}")
         
         # 存圖與記錄
         trainer.save_plots(model_tag, f"results/{model_tag}")
         
-        final_ce = trainer.history["test_ce"][-1] if trainer.history["test_ce"] else 0.0
-        final_kl = trainer.history["test_kl"][-1] if trainer.history["test_kl"] else 0.0
+        # 🌟 6. 寫入記錄 (擴充為四項完整指標)
+        f_s_ce = trainer.history["test_sample_ce"][-1] if trainer.history["test_sample_ce"] else 0.0
+        f_t_ce = trainer.history["test_theory_ce"][-1] if trainer.history["test_theory_ce"] else 0.0
+        f_s_kl = trainer.history["test_sample_kl"][-1] if trainer.history["test_sample_kl"] else 0.0
+        f_t_kl = trainer.history["test_theory_kl"][-1] if trainer.history["test_theory_kl"] else 0.0
 
         summary_data.append({
             "Dataset_Setting": dataset_str,
@@ -120,11 +123,13 @@ def run_experiment():
             "Heads": p["num_heads"],
             "Embed_Dim": p["embed_dim"],
             "LR": p["lr"],               
-            "Final_CE": f"{final_ce:.6f}",
-            "Final_KL": f"{final_kl:.6f}"
+            "Final_Sample_CE": f"{f_s_ce:.6f}",
+            "Final_Theory_CE": f"{f_t_ce:.6f}",
+            "Final_Sample_KL": f"{f_s_kl:.6f}",
+            "Final_Theory_KL": f"{f_t_kl:.6f}"
         })
 
-        # 🌟 修正：為了防止三張卡同時寫入 summary.csv 造成檔案鎖死或覆蓋，檔名加上 GPU ID 區隔
+        # 每個組合跑完即時複寫存檔，防止中斷損失數據
         csv_filename = f"results/summary_gpu{args.gpu}.csv"
         pd.DataFrame(summary_data).to_csv(csv_filename, index=False)
 
