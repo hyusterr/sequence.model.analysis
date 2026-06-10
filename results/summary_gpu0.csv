@@ -1,0 +1,2 @@
+Dataset_Setting,Model_Setting,Data_Name,Num_Symbols,N_Order,Model_Type,Layers,Heads,Embed_Dim,LR,Final_CE,Final_KL
+ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,2,1,16,3e-05,0.991622,0.193668
