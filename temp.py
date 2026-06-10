@@ -16,29 +16,13 @@ from dataset import ICLMarkovChainDataset
 # 核心 Metrics
 # ==========================================
 def compute_cross_entropy(logits, targets):
-    """只計算序列最後一個 Token 的 Cross Entropy"""
-    # logits 形狀為 [B, T, V] -> 取最後一個時間步 [B, V]
-    last_logits = logits[:, -1, :] 
-    # targets 形狀為 [B, T] -> 取最後一個時間步 [B]
-    last_targets = targets[:, -1]
-    
-    return F.cross_entropy(last_logits, last_targets, ignore_index=-1).item()
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1).item()
 
 def compute_kl_divergence(logits, target_probs):
-    """只計算序列最後一個 Token 的 KL Divergence"""
-    # logits 形狀為 [B, T, V] -> 取最後一個時間步 [B, V]
-    last_logits = logits[:, -1, :]
-    # target_probs 形狀為 [B, T, V] -> 取最後一個時間步 [B, V]
-    last_target_probs = target_probs[:, -1, :]
-    
-    # 計算最後一個位置的 log_softmax
-    log_pred_probs = F.log_softmax(last_logits, dim=-1)
-    
-    # 使用 reduction='sum' 算完總和後，除以 batch_size 即可（因為沒有 seq_len 維度了）
-    kl_sum = F.kl_div(log_pred_probs, last_target_probs, reduction='sum')
-    batch_size = logits.size(0)
-    
-    return (kl_sum / batch_size).item()
+    log_pred_probs = F.log_softmax(logits, dim=-1)
+    kl_sum = F.kl_div(log_pred_probs, target_probs, reduction='sum')
+    batch_size, seq_len, _ = logits.size()
+    return (kl_sum / (batch_size * seq_len)).item()
 
 # ==========================================
 # Trainer 類別 (完全對標 minGPT 引擎)
@@ -191,3 +175,114 @@ class Trainer:
         plt.tight_layout()
         plt.savefig(f"{filename}.png", dpi=300)
         plt.close()
+
+import itertools
+
+def run_experiment():
+    summary_data = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not os.path.exists("results"): os.makedirs("results")
+    
+    # ==========================================
+    # 🌟 擴充版超參數矩陣 (加入了 lr 進行網格搜尋)
+    # ==========================================
+    grid = {
+        "data_name": ["ICL-Markov"],
+        "num_symbols": [2],        
+        "n_order": [1, 2],            
+        "n_layer": [2, 1],         
+        "attn": ["attention-only", "standard", "linear"], 
+        "embed_dim": [16],         
+        "num_heads": [1, 2],          
+        "lr": [3e-5, 1e-4, 5e-4]   # 🌟 將 LR 放進來跑排列組合
+    }
+    
+    # 固定訓練參數 (移除 lr)
+    train_params = {
+        "seq_len": 100,
+        "epochs": 30,
+        "batch_size": 64,
+        "eval_interval": 20       
+    }
+
+    # 自動展開所有的排列組合
+    keys, values = zip(*grid.items())
+    experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    
+    # 溫馨提醒：排列組合數量會相乘，例如 2(layer) x 3(attn) x 3(lr) = 18 組實驗
+    print(f"總共準備執行 {len(experiments)} 組實驗...\n")
+
+    for p in experiments:
+        # 1. 🌟 檔名加入 LR，避免不同學習率的圖互相覆蓋
+        dataset_str = f"{p['data_name']}_V{p['num_symbols']}_O{p['n_order']}"
+        model_str = f"L{p['n_layer']}_H{p['num_heads']}_D{p['embed_dim']}_{p['attn']}_LR{p['lr']}" 
+        model_tag = f"{dataset_str}_{model_str}"
+        
+        print(f"\n>>> Running: {model_tag}")
+
+        # 2. 生成對應參數的 Dataset
+        test_ds = ICLMarkovChainDataset(train_params["seq_len"], p["num_symbols"], p["n_order"], virtual_size=4000)
+        test_loader = DataLoader(test_ds, batch_size=200, shuffle=False)
+        
+        print("    Pre-generating fixed Test Set...")
+        fixed_test_data = []
+        for x, y, p_true, info in test_loader:
+            fixed_test_data.append((x.clone(), y.clone(), p_true.clone()))
+
+        train_ds = ICLMarkovChainDataset(train_params["seq_len"], p["num_symbols"], p["n_order"], virtual_size=12800)
+        train_loader = DataLoader(train_ds, batch_size=train_params["batch_size"], shuffle=True)
+
+        # 3. 初始化 Model
+        model = Transformer(
+            vocab_size=p["num_symbols"],
+            d_model=p["embed_dim"],
+            nhead=p["num_heads"],
+            num_layers=p["n_layer"],
+            block_size=train_params["seq_len"],
+            pe_type='rpe',
+            attn_type=("standard" if p["attn"] == "attention-only" else p["attn"]),
+            attention_only=(p["attn"] == "attention-only")
+        )
+        
+        # 4. 初始化 Trainer (🌟 動態讀取 p["lr"])
+        config_for_trainer = {
+            "lr": p["lr"], 
+            "epochs": train_params["epochs"]
+        }
+        trainer = Trainer(model, train_loader, device, config_for_trainer)
+        
+        # 5. 訓練流程
+        epoch_pbar = tqdm(range(train_params["epochs"]), desc="    Epochs")
+        for epoch in epoch_pbar:
+            trainer.train_epoch(epoch + 1, model_tag, fixed_test_data, eval_interval=train_params["eval_interval"])
+            if len(trainer.history["test_kl"]) > 0:
+                epoch_pbar.set_postfix(Test_KL=f"{trainer.history['test_kl'][-1]:.4f}")
+        
+        # 6. 存圖與寫入記錄
+        trainer.save_plots(model_tag, f"results/{model_tag}")
+        
+        final_ce = trainer.history["test_ce"][-1] if trainer.history["test_ce"] else 0.0
+        final_kl = trainer.history["test_kl"][-1] if trainer.history["test_kl"] else 0.0
+
+        summary_data.append({
+            "Dataset_Setting": dataset_str,
+            "Model_Setting": model_str,
+            "Data_Name": p["data_name"],
+            "Num_Symbols": p["num_symbols"],
+            "N_Order": p["n_order"],
+            "Model_Type": p["attn"],
+            "Layers": p["n_layer"],
+            "Heads": p["num_heads"],
+            "Embed_Dim": p["embed_dim"],
+            "LR": p["lr"],               # 🌟 新增 LR 欄位到 CSV
+            "Final_CE": f"{final_ce:.6f}",
+            "Final_KL": f"{final_kl:.6f}"
+        })
+
+        # 即時存檔
+        pd.DataFrame(summary_data).to_csv("results/summary-V2.csv", index=False)
+
+    print("\n[Finished] 所有實驗執行完畢！")
+
+if __name__ == "__main__":
+    run_experiment()
