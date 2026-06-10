@@ -150,9 +150,8 @@ class HMMDataset(SequenceDataset):
         ]
         return list(zip(x_seq[:, :-1], x_seq[:, 1:], oracle_probs_seq[:, 1:], info_list))
 
-
 # ==========================================
-# 4. ICLHMMDataset (原本即正確)
+# 4. ICLHMMDataset (🌟 完美修復隱藏狀態維度對齊)
 # ==========================================
 class ICLHMMDataset(SequenceDataset):
     def __init__(self, seq_len, num_hidden, num_obs, n_order=1, virtual_size=10000):
@@ -162,36 +161,57 @@ class ICLHMMDataset(SequenceDataset):
 
     def __getitems__(self, indices):
         B = len(indices)
-        A = dist.Dirichlet(torch.ones(self.num_hidden)).sample((B, self.num_hidden**self.n_order))
+        
+        # 🌟 關鍵修正：HMM 的狀態數由隱藏狀態數 (num_hidden) 決定，而非觀測符號數 (num_symbols)
+        num_states = self.num_hidden ** self.n_order  # 修正後為 2^1 = 2
+        
+        # 1. 動態抽樣該 Batch 的參數
+        A = dist.Dirichlet(torch.ones(self.num_hidden)).sample((B, num_states)) # 修正後形狀為 [B, 2, 2] 的完美方陣
         B_mat = dist.Dirichlet(torch.ones(self.num_symbols)).sample((B, self.num_hidden))
+        
+        # 傳入 self.num_hidden 作為該馬可夫鏈的基礎字母集大小
         stat_h = batched_stationary_distribution(A, self.n_order, self.num_hidden)
         
         z_seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
         oracle_probs_seq = torch.zeros((B, self.seq_len + 1, self.num_symbols))
         
+        # 初始狀態生成
         init_idx = torch.multinomial(stat_h, 1).squeeze(-1)
         for k in range(self.n_order - 1, -1, -1):
             z_seq[:, k] = init_idx % self.num_hidden
             init_idx //= self.num_hidden
-            oracle_probs_seq[:, k] = torch.matmul(stat_h, B_mat)
+            oracle_probs_seq[:, k] = torch.einsum('bh,bhd->bd', stat_h, B_mat)
 
         batch_idx = torch.arange(B)
+        
+        # 遞迴生成 Z 序列與 Oracle 預測
         for t in range(self.n_order, self.seq_len + 1):
             idx = (z_seq[:, t-self.n_order:t] * self.hidden_powers).sum(dim=1)
-            current_A = A[batch_idx, idx] 
-            oracle_probs_seq[:, t] = torch.matmul(current_A, B_mat)
+            current_A = A[batch_idx, idx]
+            
+            oracle_probs_seq[:, t] = torch.einsum('bh,bhd->bd', current_A, B_mat)
             z_seq[:, t] = torch.multinomial(current_A, 1).squeeze(-1)
             
+        # 生成實際觀測序列 X
         true_probs_seq = B_mat[batch_idx.unsqueeze(1), z_seq] 
         flat_probs = true_probs_seq.view(-1, self.num_symbols)
         flat_x = torch.multinomial(flat_probs, 1).squeeze(-1)
         x_seq = flat_x.view(B, self.seq_len + 1)
         
+        p_true = oracle_probs_seq[:, 1:]
+        
         info_list = [
-            {"z_states": z, "A_matrix": a, "B_matrix": b, "realized_emission_probs": em}
+            {
+                "z_states": z,
+                "A_matrix": a,
+                "B_matrix": b,
+                "realized_emission_probs": em
+            }
             for z, a, b, em in zip(z_seq[:, :-1], A, B_mat, true_probs_seq[:, :-1])
         ]
-        return list(zip(x_seq[:, :-1], x_seq[:, 1:], oracle_probs_seq[:, 1:], info_list))
+        
+        return list(zip(x_seq[:, :-1], x_seq[:, 1:], p_true, info_list))
+
 
 
 # ==========================================
