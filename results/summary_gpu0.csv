@@ -1,2 +1,8 @@
-Dataset_Setting,Model_Setting,Data_Name,Num_Symbols,N_Order,Model_Type,Layers,Heads,Embed_Dim,LR,Final_CE,Final_KL
-ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,2,1,16,3e-05,0.991622,0.193668
+Dataset_Setting,Model_Setting,Data_Name,Num_Symbols,N_Order,Model_Type,Layers,Heads,Embed_Dim,LR,Final_Sample_CE,Final_Theory_CE,Final_Sample_KL,Final_Theory_KL
+ICL-Markov_V3_O1,L2_H1_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,2,1,16,3e-05,0.987036,0.983475,0.987036,0.161488
+ICL-Markov_V3_O1,L2_H2_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,2,2,16,3e-05,0.990333,0.980991,0.990333,0.164149
+ICL-Markov_V3_O1,L2_H1_D16_standard_LR3e-05,ICL-Markov,3,1,standard,2,1,16,3e-05,0.984447,0.987426,0.984447,0.165234
+ICL-Markov_V3_O1,L2_H2_D16_standard_LR3e-05,ICL-Markov,3,1,standard,2,2,16,3e-05,0.977774,0.982983,0.977774,0.165225
+ICL-Markov_V3_O1,L2_H1_D16_linear_LR3e-05,ICL-Markov,3,1,linear,2,1,16,3e-05,0.978990,0.988814,0.978990,0.163769
+ICL-Markov_V3_O1,L2_H2_D16_linear_LR3e-05,ICL-Markov,3,1,linear,2,2,16,3e-05,0.977931,0.985595,0.977931,0.160691
+ICL-Markov_V3_O1,L1_H1_D16_attention-only_LR3e-05,ICL-Markov,3,1,attention-only,1,1,16,3e-05,0.992585,0.979906,0.992585,0.167738
