@@ -1,0 +1,29 @@
+>>> Data: Markov | Model: attention-only
+>>> Data: Markov | Model: standard
+>>> Data: Markov | Model: linear
+>>> Data: Markov | Model: performer
+>>> Data: ICL-Markov | Model: attention-only
+>>> Data: ICL-Markov | Model: standard
+>>> Data: ICL-Markov | Model: linear
+>>> Data: ICL-Markov | Model: performer
+>>> Data: HMM | Model: attention-only
+Traceback (most recent call last):
+  File "/tmp2/yshuang/sequence.model.analysis/trainer.py", line 139, in <module>
+    run_experiment()
+  File "/tmp2/yshuang/sequence.model.analysis/trainer.py", line 130, in run_experiment
+    loss = trainer.train_epoch()
+  File "/tmp2/yshuang/sequence.model.analysis/trainer.py", line 30, in train_epoch
+    for x, y in self.train_loader:
+  File "/tmp2/yshuang/sequence.model.analysis/cdf_env/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 734, in __next__
+    data = self._next_data()
+  File "/tmp2/yshuang/sequence.model.analysis/cdf_env/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 790, in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+  File "/tmp2/yshuang/sequence.model.analysis/cdf_env/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/tmp2/yshuang/sequence.model.analysis/cdf_env/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/tmp2/yshuang/sequence.model.analysis/dataset.py", line 36, in __getitem__
+    full_seq = self.generate_sequence()
+  File "/tmp2/yshuang/sequence.model.analysis/dataset.py", line 122, in generate_sequence
+    init_idx //= self.hidden_hidden
+AttributeError: 'HMMDataset' object has no attribute 'hidden_hidden'

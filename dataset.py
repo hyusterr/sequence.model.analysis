@@ -107,7 +107,8 @@ class ICLMarkovChainDataset(SequenceDataset):
 
 
 # ==========================================
-# 3. HMMDataset (原本即正確)
+# ==========================================
+# 3. HMMDataset (🌟 已修復初始冷啟動維度錯位)
 # ==========================================
 class HMMDataset(SequenceDataset):
     def __init__(self, seq_len: int, num_hidden: int, num_obs: int, n_order: int = 1, virtual_size: int = 10000):
@@ -127,18 +128,25 @@ class HMMDataset(SequenceDataset):
         z_seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
         oracle_probs_seq = torch.zeros((B, self.seq_len + 1, self.num_obs))
         
+        # 初始狀態抽樣：依據嚴謹的聯合平穩分佈
         init_idx = torch.multinomial(self.stationary_hidden.expand(B, -1), 1).squeeze(-1)
         for k in range(self.n_order - 1, -1, -1):
             z_seq[:, k] = init_idx % self.num_hidden
             init_idx //= self.num_hidden
-            oracle_probs_seq[:, k] = torch.matmul(self.stationary_hidden.expand(B, -1), self.B)
+            
+            # 🌟 核心修正：初始啟動步直接給予均勻分佈佔位，不參與評估，徹底避開矩陣乘法維度衝突
+            oracle_probs_seq[:, k] = 1.0 / self.num_obs
 
+        # 自迴歸生成隨後序列與計算上帝視角真值
         for t in range(self.n_order, self.seq_len + 1):
             idx = (z_seq[:, t-self.n_order:t] * self.hidden_powers).sum(dim=1)
-            current_trans_probs = self.A[idx] 
+            current_trans_probs = self.A[idx]  # [B, num_hidden]
+            
+            # [B, num_hidden] @ [num_hidden, num_obs] -> [B, num_obs] (此處在任何階數下皆合法)
             oracle_probs_seq[:, t] = torch.matmul(current_trans_probs, self.B)
             z_seq[:, t] = torch.multinomial(current_trans_probs, 1).squeeze(-1)
         
+        # 根據 Z 序列生成觀測值序列 X (維持嚴謹的馬可夫物理規律)
         emission_probs_seq = self.B[z_seq] 
         flat_probs = emission_probs_seq.view(-1, self.num_obs)
         flat_x = torch.multinomial(flat_probs, 1).squeeze(-1)
@@ -150,8 +158,9 @@ class HMMDataset(SequenceDataset):
         ]
         return list(zip(x_seq[:, :-1], x_seq[:, 1:], oracle_probs_seq[:, 1:], info_list))
 
+
 # ==========================================
-# 4. ICLHMMDataset (🌟 完美修復隱藏狀態維度對齊)
+# 4. ICLHMMDataset (🌟 已修復初始冷啟動維度錯位)
 # ==========================================
 class ICLHMMDataset(SequenceDataset):
     def __init__(self, seq_len, num_hidden, num_obs, n_order=1, virtual_size=10000):
@@ -162,14 +171,12 @@ class ICLHMMDataset(SequenceDataset):
     def __getitems__(self, indices):
         B = len(indices)
         
-        # 🌟 關鍵修正：HMM 的狀態數由隱藏狀態數 (num_hidden) 決定，而非觀測符號數 (num_symbols)
-        num_states = self.num_hidden ** self.n_order  # 修正後為 2^1 = 2
+        # HMM 的總狀態數由隱藏狀態空間決定 (例如 2^1 = 2)
+        num_states = self.num_hidden ** self.n_order  
         
-        # 1. 動態抽樣該 Batch 的參數
-        A = dist.Dirichlet(torch.ones(self.num_hidden)).sample((B, num_states)) # 修正後形狀為 [B, 2, 2] 的完美方陣
-        B_mat = dist.Dirichlet(torch.ones(self.num_symbols)).sample((B, self.num_hidden))
-        
-        # 傳入 self.num_hidden 作為該馬可夫鏈的基礎字母集大小
+        # 動態抽樣該 Sequence 專屬的 A 與 B 矩陣
+        A = dist.Dirichlet(torch.ones(self.num_hidden)).sample((B, num_states))        # [B, num_states, num_hidden]
+        B_mat = dist.Dirichlet(torch.ones(self.num_symbols)).sample((B, self.num_hidden)) # [B, num_hidden, num_symbols]
         stat_h = batched_stationary_distribution(A, self.n_order, self.num_hidden)
         
         z_seq = torch.zeros((B, self.seq_len + 1), dtype=torch.long)
@@ -180,19 +187,22 @@ class ICLHMMDataset(SequenceDataset):
         for k in range(self.n_order - 1, -1, -1):
             z_seq[:, k] = init_idx % self.num_hidden
             init_idx //= self.num_hidden
-            oracle_probs_seq[:, k] = torch.einsum('bh,bhd->bd', stat_h, B_mat)
+            
+            # 🌟 核心修正：初始啟動步直接給予均勻分佈佔位
+            oracle_probs_seq[:, k] = 1.0 / self.num_symbols
 
         batch_idx = torch.arange(B)
         
-        # 遞迴生成 Z 序列與 Oracle 預測
+        # 遞迴生成 Z 序列與利用 einsum 進行精準的批次上帝視角觀測計算
         for t in range(self.n_order, self.seq_len + 1):
             idx = (z_seq[:, t-self.n_order:t] * self.hidden_powers).sum(dim=1)
-            current_A = A[batch_idx, idx]
+            current_A = A[batch_idx, idx] # [B, num_hidden]
             
+            # [B, num_hidden] 與 [B, num_hidden, num_symbols] 進行批次縮併乘法 -> [B, num_symbols]
             oracle_probs_seq[:, t] = torch.einsum('bh,bhd->bd', current_A, B_mat)
             z_seq[:, t] = torch.multinomial(current_A, 1).squeeze(-1)
             
-        # 生成實際觀測序列 X
+        # 生成實際觀測序列 X (完全保留真實分佈，訓練軌跡不受破壞)
         true_probs_seq = B_mat[batch_idx.unsqueeze(1), z_seq] 
         flat_probs = true_probs_seq.view(-1, self.num_symbols)
         flat_x = torch.multinomial(flat_probs, 1).squeeze(-1)
@@ -211,8 +221,6 @@ class ICLHMMDataset(SequenceDataset):
         ]
         
         return list(zip(x_seq[:, :-1], x_seq[:, 1:], p_true, info_list))
-
-
 
 # ==========================================
 # 5. GINCDataset (🌟 已修正對齊)

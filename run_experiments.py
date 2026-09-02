@@ -41,9 +41,9 @@ def run_experiment():
     # ==========================================
     grid = {
         # 資料集清單 (已暫時移除 GINC 與 HMMLDA)
-        "data_name": ["ICL-Markov", "Markov", "HMM", "ICL-HMM"],
-        "num_symbols": [3, 2],        
-        "n_order": [1, 2],            
+        "data_name": ["HMM", "ICL-HMM"],
+        "num_symbols": [2, 3],        
+        "n_order": [2, 1],            
         "n_layer": [2, 1],         
         
         # 核心架構變體
