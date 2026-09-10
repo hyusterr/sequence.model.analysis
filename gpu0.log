@@ -1,0 +1,12 @@
+🚀 GPU 0 啟動！專屬任務：Linear Transformer。LRs: [0.0005]
+過濾不相容 PE 後，GPU 0 總計分配到 192 組實驗任務。
+
+
+[GPU 0] >>> Config: ICL-Markov_V2_O1_L2_H1_D16_linear_AttnOnlyTrue_PE-none_ResTrue_LNTrue_LR0.0005
+Traceback (most recent call last):
+  File "/tmp2/yshuang/sequence.model.analysis/run_experiments.py", line 204, in <module>
+    run_experiment()
+  File "/tmp2/yshuang/sequence.model.analysis/run_experiments.py", line 137, in run_experiment
+    model = Transformer(
+            ^^^^^^^^^^^^
+TypeError: Transformer.__init__() got an unexpected keyword argument 'use_ln'

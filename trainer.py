@@ -19,39 +19,36 @@ def compute_all_metrics(logits, targets, target_probs, eps=1e-12):
     對最後一個位置計算四種指標的排列組合
     logits: [B, T, V]
     targets: [B, T]
-    target_probs: [B, T, V]
+    target_probs: [B, T, V] (Ground Truth 轉移矩陣的機率分佈)
     """
-    # 統一鎖定 Last Token
+    # 統一鎖定 Last Token (符合理論預測最後一個字眼的需求)
     last_logits = logits[:, -1, :]          # [B, V]
-    last_y = targets[:, -1]                  # [B]
+    last_y = targets[:, -1]                 # [B]
     last_p_true = target_probs[:, -1, :]    # [B, V]
     
-    # 模型預測的 Log-probabilities 與 Probabilities
+    # 模型預測的 Log-probabilities
     log_pred = F.log_softmax(last_logits, dim=-1)
-    pred_prob = torch.exp(log_pred)
     
     # ------------------------------------------
-    # 1. Cross Entropy 家族
+    # 1. Sample Metrics (針對離散觀測值)
     # ------------------------------------------
     # Sample CE: 標準 Cross Entropy (對 One-hot 標籤)
     sample_ce = F.cross_entropy(last_logits, last_y, ignore_index=-1).item()
     
+    # Sample KL: 因為目標是確定的離散 Token (One-hot分佈)，其資訊熵 H(P) = 0
+    # 數學上 KL(OneHot || Q) = H(OneHot, Q) - H(OneHot) = Sample CE
+    sample_kl = sample_ce 
+    
+    # ------------------------------------------
+    # 2. Theoretical Metrics (針對連續機率分佈的期望值)
+    # ------------------------------------------
     # Theoretical CE: -sum( P_true * log(Q) )
     theoretical_ce = -(last_p_true * log_pred).sum(dim=-1).mean().item()
     
-    # ------------------------------------------
-    # 2. KL Divergence 家族
-    # ------------------------------------------
-    # Theoretical KL: 標準論文觀測指標 sum( P_true * log(P_true / Q) )
-    # 使用 'batchmean' 對應批次平均
+    # Theoretical KL: sum( P_true * log(P_true / Q) )
+    # PyTorch API 參數順序為 (input_log_prob, target_prob)
+    # 使用 'batchmean' 確保對 batch 維度正確取平均
     theoretical_kl = F.kl_div(log_pred, last_p_true, reduction='batchmean').item()
-    
-    # Sample KL: sum( Y_onehot * log(Y_onehot / Q) )
-    # Y_onehot 在真實出現的位置為 1，其餘為 0。因此簡化為: 1 * log(1 / Q_target) = -log(Q_target)
-    # 注意：在資訊理論中，對 One-hot 算 KL，數值等同於 Sample CE 扣掉 One-hot 自身的熵 (0)
-    # 為了保持嚴謹度，這裡實作完整的 KL 邏輯：
-    y_one_hot = F.one_hot(last_y, num_classes=logits.size(-1)).float()
-    sample_kl = (y_one_hot * (torch.log(y_one_hot + eps) - log_pred)).sum(dim=-1).mean().item()
     
     return sample_ce, theoretical_ce, sample_kl, theoretical_kl
 
@@ -88,7 +85,7 @@ class Trainer:
         self.warmup_steps = 10 
         self.max_steps = self.epochs * len(train_loader)
         
-        # 擴充歷史儲存架構
+        # 歷史儲存架構
         self.history = {
             "examples_seen": [],
             "train_sample_ce": [], "train_theory_ce": [], "train_sample_kl": [], "train_theory_kl": [],
@@ -117,6 +114,7 @@ class Trainer:
             x, y, p_true = x.to(self.device), y.to(self.device), p_true.to(self.device)
             
             self.optimizer.zero_grad()
+            # 這裡的 loss 是整條序列的平均 CE，負責提供充沛的梯度訊號
             logits, loss = self.model(x, y)
             loss.backward()
             self.optimizer.step()
@@ -126,6 +124,7 @@ class Trainer:
             
             if self.total_steps % eval_interval == 0:
                 with torch.no_grad():
+                    # 訓練集的指標監控鎖定 Last Token
                     s_ce, t_ce, s_kl, t_kl = compute_all_metrics(logits, y, p_true)
                     self.history["examples_seen"].append(self.examples_seen)
                     self.history["train_sample_ce"].append(s_ce)

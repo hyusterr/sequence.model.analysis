@@ -16,7 +16,7 @@ class TokenEmbedding(nn.Module):
         return self.emb(x)
 
 class AbsolutePositionalEncoding(nn.Module):
-    """APE: 絕對位置編碼變體"""
+    """APE: 絕對位置編碼"""
     def __init__(self, d_model, block_size):
         super().__init__()
         self.wpe = nn.Embedding(block_size, d_model)
@@ -27,7 +27,7 @@ class AbsolutePositionalEncoding(nn.Module):
         return x + self.wpe(pos)
 
 class RotaryPositionEmbedding(nn.Module):
-    """RoPE: 旋轉位置編碼變體 (完美相容 Linear/Performer 的結合律)"""
+    """RoPE: 旋轉位置編碼 (相容 Linear/Performer 的結合律)"""
     def __init__(self, dim, max_seq_len):
         super().__init__()
         # 依據標準定義計算逆頻率 (Inverse Frequency)
@@ -53,8 +53,6 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     """將 RoPE 旋轉矩陣套用至 Query 與 Key"""
-    # q, k 形狀: [B, H, T, D]
-    # cos, sin 形狀: [1, 1, T, D]
     q_rotated = (q * cos) + (rotate_half(q) * sin)
     k_rotated = (k * cos) + (rotate_half(k) * sin)
     return q_rotated, k_rotated
@@ -80,14 +78,10 @@ class MultiHeadAttention(nn.Module):
         # 註冊標準因果遮罩 (Causal Mask)
         self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
 
-        # 變體 A: 相對位置編碼 (RPE) 初始化 (僅 Standard 可用)
+        # 變體 A: 純加法相對位置編碼 (RPE) 初始化 (僅 Standard 可用)
         if pe_type == 'rpe':
-            self.wpe_rel = nn.Embedding(block_size + 1, d_model, padding_idx=block_size)
-            pos = torch.arange(block_size).unsqueeze(0)
-            pos = pos.view(-1, 1) - pos.view(1, -1)
-            pos = torch.maximum(pos, torch.tensor(-1))
-            pos[pos == -1] = block_size
-            self.register_buffer("pos_matrix", pos)
+            # 建立純量偏置，距離範圍從 -block_size 到 +block_size，因此大小為 2 * block_size + 1
+            self.wpe_rel = nn.Embedding(2 * block_size + 1, nhead)
 
         # 變體 B: 旋轉位置編碼 (RoPE) 初始化 (所有模型通用)
         if pe_type == 'rope':
@@ -121,7 +115,7 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.nhead, self.head_dim).transpose(1, 2)
 
-        # 🌟 核心整合：若選用 RoPE，在進入任何注意力分支前，直接旋轉 Q 與 K 的特徵軸
+        # 核心整合：若選用 RoPE，在進入任何注意力分支前，直接旋轉 Q 與 K 的特徵軸
         if self.pe_type == 'rope':
             cos, sin = self.rope(q, seq_len=T)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -131,10 +125,19 @@ class MultiHeadAttention(nn.Module):
         # ------------------------------------------
         if self.attn_type == 'standard':
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            
+            # 純加法 RPE (Shaw et al.)，嚴格對齊理論中的純量偏置 r_{i-j}
             if self.pe_type == 'rpe':
-                rpe_bias = torch.einsum("ijhe,bhie->bhij", self.wpe_rel(self.pos_matrix[:T, :T]).view(T, T, self.nhead, self.head_dim), q)
-                att += rpe_bias * (1.0 / math.sqrt(self.head_dim))
-            att = F.softmax(att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')), dim=-1)
+                positions = torch.arange(T, device=q.device)
+                # 計算相對距離索引，將範圍 [-T+1, T-1] 平移為全正數
+                rel_pos = positions.unsqueeze(0) - positions.unsqueeze(1) + self.bias.size(-1)
+                # 取得每個 head 的偏置，形狀為 [T, T, H] -> 轉換為 [1, H, T, T] 以利廣播加法
+                rpe_bias = self.wpe_rel(rel_pos).permute(2, 0, 1).unsqueeze(0)
+                att += rpe_bias
+                
+            # 因果遮罩 (過濾掉對未來的注意力)
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
             y = self.attn_dropout(att) @ v
 
         # ------------------------------------------
@@ -192,13 +195,17 @@ class PositionWiseFFN(nn.Module):
         return self.net(x)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, nhead, d_ff, block_size, pe_type, attn_type, attention_only=False, use_residual=True):
+    # 🌟 這裡補上 use_ln
+    def __init__(self, d_model, nhead, d_ff, block_size, pe_type, attn_type, attention_only=False, use_residual=True, use_ln=True):
         super().__init__()
         self.use_residual, self.attention_only = use_residual, attention_only
-        self.ln1 = nn.LayerNorm(d_model)
+        
+        # 🌟 根據 use_ln 決定是否使用 LayerNorm
+        self.ln1 = nn.LayerNorm(d_model) if use_ln else nn.Identity()
         self.attn = MultiHeadAttention(d_model, nhead, block_size, pe_type, attn_type)
+        
         if not attention_only:
-            self.ln2 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model) if use_ln else nn.Identity()
             self.ffn = PositionWiseFFN(d_model, d_ff)
 
     def forward(self, x):
@@ -210,26 +217,29 @@ class TransformerBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
+    # 🌟 這裡補上 use_ln
     def __init__(self, vocab_size, d_model, nhead, num_layers, block_size, 
-                 pe_type='none', attn_type='standard', attention_only=False, use_residual=True):
+                 pe_type='none', attn_type='standard', attention_only=False, use_residual=True, use_ln=True):
         super().__init__()
         
-        # 🌟 核心修復：升級自動防錯護欄
-        # 傳統 RPE 矩陣會徹底摧毀 Linear/Performer 的線性複雜度。若誤配，自動無損升級為支援結合律的 RoPE！
+        # 🌟 自動防錯護欄：傳統 RPE 矩陣無法進行結合律分解。若在線性變體中誤配，強制無損升級為 RoPE。
         if attn_type in ['linear', 'performer'] and pe_type == 'rpe':
-            print(f"⚠️ [Guardrail] {attn_type} 不支援 Additive RPE。已自動升級為 RoPE 變體，完美保持線性時間複雜度與相對位置感知！")
+            print(f"⚠️ [Guardrail] {attn_type} 不支援 Additive RPE。已自動升級為 RoPE 變體。")
             pe_type = 'rope'
             
         self.token_emb = TokenEmbedding(vocab_size, d_model)
         
-        # 只有當選用 APE ('absolute') 時，才在輸入端疊加絕對編碼矩陣。RPE 與 RoPE 均在 Attention 內部實作。
+        # 僅在選用 APE 時在輸入端疊加絕對編碼
         self.abs_pe = AbsolutePositionalEncoding(d_model, block_size) if pe_type == 'absolute' else nn.Identity()
         
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, nhead, 4*d_model, block_size, pe_type, attn_type, attention_only, use_residual) 
+            # 🌟 這裡要把 use_ln 傳遞給 Block
+            TransformerBlock(d_model, nhead, 4*d_model, block_size, pe_type, attn_type, attention_only, use_residual, use_ln) 
             for _ in range(num_layers)
         ])
-        self.ln_f = nn.LayerNorm(d_model)
+        
+        # 🌟 最後一層的 LayerNorm 也受 use_ln 控制
+        self.ln_f = nn.LayerNorm(d_model) if use_ln else nn.Identity()
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
         # 權重初始化
@@ -254,5 +264,8 @@ class Transformer(nn.Module):
         for block in self.blocks: 
             x = block(x)
         logits = self.head(self.ln_f(x))
+        
+        # 訓練時的 Loss 計算維持標準 Language Modeling 設定，考慮序列中的所有 Token
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) if targets is not None else None
+        
         return logits, loss
